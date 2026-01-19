@@ -1,0 +1,89 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug (nvim - codelldb 2)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "./target/debug/systemd_traefik_configuration_provider",
+            "cwd": "${workspaceFolder}",
+            "stopOnEntry": false,
+            "args": [],
+            "env": {
+              "WATCHED_UNITS_FILE": "${workspaceFolder}/test/watched-units",
+              "TRAEFIK_OUT_DIR": "${workspaceFolder}/test/units/",
+              "RUST_LOG": "systemd_traefik_configuration_provider=trace",
+            },
+            "preRunCommands": [
+                "command script import ${workspaceFolder}/.vscode/rust_prettifier_for_lldb.py"
+            ],
+        },
+        {
+            "name": "Debug test (nvim - codelldb)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "./target/debug/deps/systemd_traefik_configuration_provider-67ac22f37e896e09",
+            "cwd": "${workspaceFolder}",
+            "stopOnEntry": false,
+            "args": [],
+            "preRunCommands": [
+                "command script import ${workspaceFolder}/.vscode/rust_prettifier_for_lldb.py"
+            ],
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=systemd_traefik_configuration_provider-bin",
+                    "--package=systemd_traefik_configuration_provider-bin"
+                ],
+                "filter": {
+                    "name": "systemd_traefik_configuration_provider-bin",
+                    "kind": "bin"
+                },
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}",
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=systemd_traefik_configuration_provider-bin",
+                    "--package=systemd_traefik_configuration_provider-bin"
+                ],
+                "filter": {
+                    "name": "systemd_traefik_configuration_provider-bin",
+                    "kind": "bin"
+                },
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}",
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in executable 'systemd_traefik_configuration_provider-bin'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--bin=systemd_traefik_configuration_provider-bin",
+                    "--package=systemd_traefik_configuration_provider-bin"
+                ],
+                "filter": {
+                    "name": "systemd_traefik_configuration_provider-bin",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

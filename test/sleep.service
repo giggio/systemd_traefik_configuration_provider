@@ -1,0 +1,14 @@
+[Service]
+ExecStart=sleep infinity
+Type=simple
+
+[Unit]
+Description=Sample sleep service
+
+[X-Traefik]
+Label=traefik.http.routers.sleep.entrypoints=websecure
+Label=traefik.http.routers.sleep.rule=Host(`test.giggio.net`)
+Label=traefik.http.routers.sleep.tls=true
+Label=traefik.http.routers.sleep.tls.certresolver=le
+Label=traefik.http.routers.sleep.tls.domains[0].main=*.giggio.net
+Label=traefik.services.sleep.loadbalancer.servers[0].url=http://127.0.0.1:8080

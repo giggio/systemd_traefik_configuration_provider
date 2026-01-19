@@ -1,0 +1,35 @@
+[package]
+name = "systemd_traefik_configuration_provider"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[features]
+default = ["proptests"] # runs proptests with all tests, if build gets slow, remove it from default feature and run with `cargo nextest run --all-features prop_test::`
+proptests = []
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1.89"
+clap = { version = "4.5.54", features = ["derive", "env"] }
+clap-verbosity-flag = "3.0.4"
+deunicode = "1.6.2"
+flexi_logger = { version = "0.31.8", features = ["kv", "async"] }
+futures = "0.3"
+log = { version = "0.4.29", features = ["kv"] }
+regex = "1.12.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9.34"
+systemd-lsp = "0.2.0"
+thiserror = "2.0.18"
+tokio = { version = "1", features = ["full"] }
+zbus = "5"
+zvariant = "5"
+
+[dev-dependencies]
+ctor = "0.6.3"
+mockall = "0.14"
+pretty_assertions = "1.4.1"
+proptest = "1.9.0"
+serial_test = "3.3.1"
+tempfile = "3"

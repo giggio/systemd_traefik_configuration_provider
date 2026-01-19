@@ -1,0 +1,42 @@
+name: Build
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+*"
+    paths-ignore:
+      - "*.md"
+      - "*.yaml"
+      - .editorconfig
+      - ".forgejo/**"
+      - .gitignore
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - "*.md"
+      - "*.yaml"
+      - .editorconfig
+      - ".forgejo/**"
+      - .gitignore
+jobs:
+  build:
+    name: cargo build
+    runs-on: docker
+    container:
+      image: ghcr.io/catthehacker/ubuntu:act-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix
+        uses: https://github.com/DeterminateSystems/nix-installer-action.git@main
+      - name: Set user for Cachix
+        run: echo "USER=root" >> $GITHUB_ENV
+      - name: Set up cache
+        uses: https://github.com/cachix/cachix-action.git@v15
+        with:
+          name: stcp
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - name: Build and test
+        run: nix build --print-build-logs
