@@ -80,10 +80,10 @@ impl DBusContext<'static> {
     pub async fn watch_units(
         &self,
         units_lock: UnitList,
-    ) -> Result<(
+    ) -> (
         Vec<tokio::task::JoinHandle<()>>,
         tokio::sync::mpsc::Receiver<NewUnit>,
-    )> {
+    ) {
         let (tx_new_unit, rx_new_unit) = tokio::sync::mpsc::channel::<NewUnit>(100);
         let units_lock_new_clone = units_lock.clone();
         let self_new_clone = self.clone();
@@ -107,7 +107,10 @@ impl DBusContext<'static> {
                 {
                     let units = units_lock_new_clone.read().await;
                     if units.contains_key(&name) {
+                        trace!("Already watching unit {}", &name);
                         continue;
+                    } else {
+                        trace!("Watching unit {}", &name);
                     }
                 }
                 if let Some(unit_data) = self_new_clone
@@ -115,16 +118,18 @@ impl DBusContext<'static> {
                     .await
                 {
                     let mut units = units_lock_new_clone.write().await;
-                    trace!("Adding unit {} to watched list", &unit_data.name);
                     let unit_name = unit_data.name.clone();
+                    trace!("Adding unit {} to watched list", unit_name);
                     units.insert(unit_name.clone(), unit_data);
                     if let Err(e) = tx_new_unit.send(NewUnit { unit: unit_name }).await {
                         error!("Error sending new unit event: {:#}", e);
                     }
+                } else {
+                    trace!("Did not create unit {}", &name);
                 }
             }
         });
-        Ok((vec![h1], rx_new_unit))
+        (vec![h1], rx_new_unit)
     }
 
     pub async fn get_messages(
@@ -253,6 +258,7 @@ impl<'a> DBusContext<'a> {
         if !name.ends_with(".service") {
             return None;
         }
+        trace!("Creating unit {}", name);
         let proxy = match self.manager.get_unit(object_path).await {
             Ok(proxy) => proxy,
             Err(e) => {
@@ -355,6 +361,7 @@ impl<'a> DBusContext<'a> {
             let parser = systemd_lsp::SystemdParser::new();
             let unit_config = parser.parse(&text);
             if let Some(section) = unit_config.sections.get("X-Traefik") {
+                trace!("Found X-Traefik in {}", file);
                 for directive in section.directives.iter().filter(|d| d.key == "Label") {
                     lines.push(directive.value.to_owned());
                 }
@@ -651,7 +658,7 @@ mod tests {
         let context = DBusContext::new_test_context(Arc::new(mock_manager), mock_fs);
         let units_lock = Arc::new(RwLock::new(HashMap::new()));
 
-        let (handles, mut rx_new_unit) = context.watch_units(units_lock.clone()).await.unwrap();
+        let (handles, mut rx_new_unit) = context.watch_units(units_lock.clone()).await;
 
         let event =
             tokio::time::timeout(tokio::time::Duration::from_millis(500), rx_new_unit.recv())
