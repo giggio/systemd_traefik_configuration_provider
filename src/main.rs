@@ -30,7 +30,7 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> std::result::Result<(), String> {
     let args = args::Cli::parse();
-    let _logger_handle = logger::start(args.verbosity.log_level_filter())
+    let _logger_handle = logger::start(args.verbosity.log_level_filter(), args.log_hide_date)
         .map_err(|e| format!("Error starting logger: {e}"))?;
     if let Err(e) = run(args.traefik_out_dir).await.map_err(|e| e.to_string()) {
         error!("Got an error: {}", e);
@@ -85,7 +85,7 @@ mod tests {
 
     #[ctor::ctor]
     static LOGGER: flexi_logger::LoggerHandle = {
-        let logger_handle_result = logger::start(log::LevelFilter::Off);
+        let logger_handle_result = logger::start(log::LevelFilter::Off, false);
         match logger_handle_result {
             Ok(r) => r,
             Err(e) => {

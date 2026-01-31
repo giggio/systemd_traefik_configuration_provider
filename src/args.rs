@@ -7,6 +7,9 @@ pub struct Cli {
     #[command(flatten)]
     pub verbosity: clap_verbosity_flag::Verbosity,
 
+    #[arg(short = 'd', long, env = "TRAEFIK_LOG_HIDE_DATE", global = true)]
+    pub log_hide_date: bool,
+
     #[arg(
         short,
         long,
