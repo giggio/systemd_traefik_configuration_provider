@@ -91,7 +91,7 @@ pub async fn handle_service_state_changed(
 ) -> Result<()> {
     trace!(
         "Handling start/stop for unit {}, started={started}",
-        &unit_data.name
+        unit_data.name
     );
     if started {
         let lines = dbus

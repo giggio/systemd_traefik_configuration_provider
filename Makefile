@@ -19,6 +19,9 @@ clean:
 run:
 	cargo run
 
+lint:
+	cargo clippy --all-targets -- -D warnings
+
 build_release:
 	cargo build --release
 

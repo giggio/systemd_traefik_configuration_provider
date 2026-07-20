@@ -58,7 +58,7 @@ fn detailed_format(
 
     write_key_value_pairs(w, record)?;
 
-    write!(w, "{}", &record.args())
+    write!(w, "{}", record.args())
 }
 fn colored_detailed_format(
     w: &mut dyn std::io::Write,
@@ -91,7 +91,7 @@ fn detailed_format_no_date(
 
     write_key_value_pairs(w, record)?;
 
-    write!(w, "{}", &record.args())
+    write!(w, "{}", record.args())
 }
 fn colored_detailed_format_no_date(
     w: &mut dyn std::io::Write,

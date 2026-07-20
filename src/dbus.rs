@@ -129,10 +129,10 @@ impl DBusContext<'static> {
                 {
                     let units = units_lock_new_clone.read().await;
                     if units.contains_key(&name) {
-                        trace!("Already watching unit {}", &name);
+                        trace!("Already watching unit {}", name);
                         continue;
                     } else {
-                        trace!("Watching unit {}", &name);
+                        trace!("Watching unit {}", name);
                     }
                 }
                 match self_new_clone
@@ -149,11 +149,14 @@ impl DBusContext<'static> {
                         }
                     }
                     UnitCreation::Untracked => {
-                        trace!("Did not create unit {}", &name);
+                        trace!("Did not create unit {}", name);
                         ignored.insert(name);
                     }
                     UnitCreation::Failed => {
-                        trace!("Did not create unit {} (inspection failed, will retry)", &name);
+                        trace!(
+                            "Did not create unit {} (inspection failed, will retry)",
+                            name
+                        );
                     }
                 }
             }
@@ -201,7 +204,7 @@ impl DBusContext<'static> {
             tokio::select! {
                 event = rx_new_unit.recv() => {
                     if let Some(event) = event {
-                        info!("New unit being wached: {}", &event.unit);
+                        info!("New unit being wached: {}", event.unit);
                         let new_unit_changes_stream = self.create_changes_stream(event.unit).await;
                         changes_stream.extend(new_unit_changes_stream);
                         has_initial_units  = true;
@@ -447,7 +450,7 @@ impl<'a> DBusContext<'a> {
                     unit_name: unit_name_clone,
                     started: state == "active",
                 };
-                trace!("New job: {:?}", &job);
+                trace!("New job: {:?}", job);
                 Some(job)
             }
         })

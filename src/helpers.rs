@@ -143,7 +143,7 @@ mod proptests {
         ) {
             let input = format!("{}{}", alphanumeric, special);
             let result = sanitize_filename(&input);
-            prop_assert_eq!(result, format!("{}", alphanumeric));
+            prop_assert_eq!(result, alphanumeric.to_string());
         }
     }
 }
