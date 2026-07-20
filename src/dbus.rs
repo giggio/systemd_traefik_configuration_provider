@@ -1,4 +1,9 @@
-use std::{collections::HashMap, path::Path, pin::Pin, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    pin::Pin,
+    sync::Arc,
+};
 
 use crate::{helpers::*, infra::FileSystem};
 
@@ -36,6 +41,15 @@ pub struct NewUnit {
 pub struct NewUnitArgs {
     id: String,
     unit: String,
+}
+
+enum UnitCreation {
+    /// The unit has Traefik config and should be watched.
+    Tracked(UnitData),
+    /// The unit was inspected and has no Traefik config; it is safe to stop probing it.
+    Untracked,
+    /// Inspecting the unit failed; the error may be transient, so the result is not cached.
+    Failed,
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -95,6 +109,11 @@ impl DBusContext<'static> {
                     return;
                 }
             };
+            // Names already inspected and found to carry no Traefik config. systemd emits a
+            // fresh UnitNew every time a not-found unit is re-materialized, and inspecting it
+            // re-materializes it, so without this cache a single ghost reference would make the
+            // daemon probe it forever in a tight loop.
+            let mut ignored: HashSet<String> = HashSet::new();
             while let Some(unit_res) = unit_new_stream.next().await {
                 let args = match unit_res {
                     Ok(args) => args,
@@ -104,6 +123,9 @@ impl DBusContext<'static> {
                     }
                 };
                 let name = args.id.clone();
+                if ignored.contains(&name) {
+                    continue;
+                }
                 {
                     let units = units_lock_new_clone.read().await;
                     if units.contains_key(&name) {
@@ -113,19 +135,26 @@ impl DBusContext<'static> {
                         trace!("Watching unit {}", &name);
                     }
                 }
-                if let Some(unit_data) = self_new_clone
+                match self_new_clone
                     .create_unit(name.clone(), args.unit.clone())
                     .await
                 {
-                    let mut units = units_lock_new_clone.write().await;
-                    let unit_name = unit_data.name.clone();
-                    trace!("Adding unit {} to watched list", unit_name);
-                    units.insert(unit_name.clone(), unit_data);
-                    if let Err(e) = tx_new_unit.send(NewUnit { unit: unit_name }).await {
-                        error!("Error sending new unit event: {:#}", e);
+                    UnitCreation::Tracked(unit_data) => {
+                        let mut units = units_lock_new_clone.write().await;
+                        let unit_name = unit_data.name.clone();
+                        trace!("Adding unit {} to watched list", unit_name);
+                        units.insert(unit_name.clone(), unit_data);
+                        if let Err(e) = tx_new_unit.send(NewUnit { unit: unit_name }).await {
+                            error!("Error sending new unit event: {:#}", e);
+                        }
                     }
-                } else {
-                    trace!("Did not create unit {}", &name);
+                    UnitCreation::Untracked => {
+                        trace!("Did not create unit {}", &name);
+                        ignored.insert(name);
+                    }
+                    UnitCreation::Failed => {
+                        trace!("Did not create unit {} (inspection failed, will retry)", &name);
+                    }
                 }
             }
         });
@@ -241,7 +270,9 @@ impl<'a> DBusContext<'a> {
         for unit in units {
             let name = unit.0;
             let object_path = unit.6;
-            if let Some(unit_data) = self.create_unit(name, object_path.to_string()).await {
+            if let UnitCreation::Tracked(unit_data) =
+                self.create_unit(name, object_path.to_string()).await
+            {
                 units_map.insert(unit_data.name.clone(), unit_data);
             }
         }
@@ -254,36 +285,33 @@ impl<'a> DBusContext<'a> {
         Ok(unit_list)
     }
 
-    async fn create_unit(&self, name: String, object_path: String) -> Option<UnitData> {
+    async fn create_unit(&self, name: String, object_path: String) -> UnitCreation {
         if !name.ends_with(".service") {
-            return None;
+            return UnitCreation::Untracked;
         }
         trace!("Creating unit {}", name);
         let proxy = match self.manager.get_unit(object_path).await {
             Ok(proxy) => proxy,
             Err(e) => {
                 error!("Error getting unit: {:#}", e);
-                return None;
+                return UnitCreation::Failed;
             }
         };
         let unit_data = UnitData {
             proxy,
             name: name.clone(),
         };
-        let is_tracked = match self
+        match self
             .has_traefik_config_in_configuration_files(&unit_data)
             .await
         {
-            Ok(is_tracked) => is_tracked,
+            Ok(true) => UnitCreation::Tracked(unit_data),
+            Ok(false) => UnitCreation::Untracked,
             Err(e) => {
                 error!("Error getting unit: {:#}", e);
-                return None;
+                UnitCreation::Failed
             }
-        };
-        if is_tracked {
-            return Some(unit_data);
         }
-        None
     }
 
     pub async fn is_unit_running(&self, unit_name: String) -> Result<bool> {
@@ -673,6 +701,63 @@ mod tests {
         for h in handles {
             h.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn test_watch_units_probes_untracked_unit_only_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut mock_manager = MockSystemdManager::new();
+
+        // systemd announces the same not-found unit twice (in reality: endlessly, as the
+        // daemon's own probing re-materializes it). The daemon must inspect it only once.
+        let args1 = NewUnitArgs {
+            id: "ghost.service".to_string(),
+            unit: "/obj/path".to_string(),
+        };
+        let args2 = NewUnitArgs {
+            id: "ghost.service".to_string(),
+            unit: "/obj/path".to_string(),
+        };
+        mock_manager.expect_receive_unit_new().return_once(move || {
+            Ok(Box::pin(futures::stream::iter(vec![Ok(args1), Ok(args2)]))
+                as Pin<Box<dyn Stream<Item = Result<NewUnitArgs>> + Send>>)
+        });
+
+        let probe_count = Arc::new(AtomicUsize::new(0));
+        let probe_count_clone = probe_count.clone();
+        mock_manager.expect_get_unit().returning(move |_| {
+            probe_count_clone.fetch_add(1, Ordering::SeqCst);
+            let mut u = MockSystemdUnit::new();
+            u.expect_drop_in_paths().returning(|| Ok(vec![]));
+            u.expect_fragment_path()
+                .returning(|| Ok("/lib/systemd/system/ghost.service".to_string()));
+            Ok(Box::new(u))
+        });
+
+        // No config file on disk -> the unit is untracked.
+        let mock_fs = Arc::new(MockFileSystem::new());
+
+        let context = DBusContext::new_test_context(Arc::new(mock_manager), mock_fs);
+        let units_lock = Arc::new(RwLock::new(HashMap::new()));
+
+        let (handles, _rx_new_unit) = context.watch_units(units_lock.clone()).await;
+
+        // The stream is finite, so the watch task ends once both events are drained.
+        for h in handles {
+            tokio::time::timeout(tokio::time::Duration::from_millis(500), h)
+                .await
+                .expect("watch task did not finish")
+                .expect("watch task panicked");
+        }
+
+        assert_eq!(
+            probe_count.load(Ordering::SeqCst),
+            1,
+            "an untracked unit must be inspected only once, then cached"
+        );
+        let units = units_lock.read().await;
+        assert!(!units.contains_key("ghost.service"));
     }
 
     #[tokio::test]
