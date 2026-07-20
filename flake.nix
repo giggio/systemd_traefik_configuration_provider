@@ -88,6 +88,8 @@
             yq-go
             gnumake
             zbus-xmlgen
+            forgejo-runner
+            cachix
           ];
         };
         formatter = pkgs.nixpkgs-fmt;
