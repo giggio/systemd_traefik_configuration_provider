@@ -20,8 +20,20 @@ impl FileSystem for RealFileSystem {
         Ok(std::fs::read_to_string(path)?)
     }
 
+    /// Traefik watches the directory, so the file is replaced with a rename instead of being
+    /// truncated and rewritten, which Traefik could read half written. The temporary file name
+    /// does not end in `.yml`, so Traefik ignores it.
     fn write(&self, path: &Path, contents: &str) -> Result<()> {
-        Ok(std::fs::write(path, contents)?)
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| anyhow!("no file name in {}", path.display()))?;
+        let tmp_path = path.with_file_name(format!(".{}.tmp", file_name.to_string_lossy()));
+        std::fs::write(&tmp_path, contents)?;
+        if let Err(e) = std::fs::rename(&tmp_path, path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
+        Ok(())
     }
 
     fn exists(&self, path: &Path) -> bool {
@@ -108,6 +120,32 @@ pub mod tests {
         pub fn file_exists_in_memory(&self, path: impl AsRef<str>) -> bool {
             self.files.lock().unwrap().contains_key(path.as_ref())
         }
+    }
+
+    #[test]
+    fn test_real_write_replaces_file_atomically() {
+        use std::io::Read;
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("web.service.yml");
+        std::fs::write(&path, "old").unwrap();
+        let mut reader_of_old_file = std::fs::File::open(&path).unwrap();
+
+        RealFileSystem.write(&path, "new").unwrap();
+
+        let mut seen_by_old_reader = String::new();
+        reader_of_old_file
+            .read_to_string(&mut seen_by_old_reader)
+            .unwrap();
+        assert_eq!(
+            seen_by_old_reader, "old",
+            "the file was truncated in place instead of replaced"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        let files = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(files, vec!["web.service.yml"]);
     }
 
     impl FileSystem for MockFileSystem {
