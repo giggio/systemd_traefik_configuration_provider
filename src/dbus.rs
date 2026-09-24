@@ -91,29 +91,45 @@ pub trait SystemdUnit: Send + Sync {
 }
 
 impl DBusContext<'static> {
-    pub async fn watch_units(
+    /// Subscribes to UnitNew before listing the loaded units, so a unit loaded while the list
+    /// is being built is still announced, instead of falling in the gap between both.
+    pub async fn load_and_watch_units(
         &self,
-        units_lock: UnitList,
-    ) -> (
+    ) -> Result<(
+        UnitList,
         Vec<tokio::task::JoinHandle<()>>,
         tokio::sync::mpsc::Receiver<NewUnit>,
-    ) {
-        let (tx_new_unit, rx_new_unit) = tokio::sync::mpsc::channel::<NewUnit>(100);
-        // zbus stops reading the socket (method replies included) while any signal stream's
-        // queue is full, so the UnitNew stream must never wait on D-Bus calls made while
-        // inspecting a unit, or a burst of UnitNew (e.g. on daemon-reload) deadlocks the
-        // connection. It is drained into an unbounded channel on its own task instead.
-        let (tx_unit_new_args, mut rx_unit_new_args) =
+    )> {
+        let (drain_handle, rx_unit_new_args) = self.drain_unit_new().await?;
+        let units_lock = match self.list_units().await {
+            Ok(units_lock) => units_lock,
+            Err(e) => {
+                drain_handle.abort();
+                return Err(e);
+            }
+        };
+        let (process_handle, rx_new_unit) = self.watch_units(units_lock.clone(), rx_unit_new_args);
+        Ok((units_lock, vec![drain_handle, process_handle], rx_new_unit))
+    }
+
+    /// zbus stops reading the socket (method replies included) while any signal stream's
+    /// queue is full, so the UnitNew stream must never wait on D-Bus calls made while
+    /// inspecting a unit, or a burst of UnitNew (e.g. on daemon-reload) deadlocks the
+    /// connection. It is drained into an unbounded channel on its own task instead.
+    async fn drain_unit_new(
+        &self,
+    ) -> Result<(
+        tokio::task::JoinHandle<()>,
+        tokio::sync::mpsc::UnboundedReceiver<NewUnitArgs>,
+    )> {
+        let mut unit_new_stream = self
+            .manager
+            .receive_unit_new()
+            .await
+            .context("receiving unit new stream")?;
+        let (tx_unit_new_args, rx_unit_new_args) =
             tokio::sync::mpsc::unbounded_channel::<NewUnitArgs>();
-        let manager = self.manager.clone();
         let drain_handle = tokio::spawn(async move {
-            let mut unit_new_stream = match manager.receive_unit_new().await {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("Error receiving unit new stream: {:#}", e);
-                    return;
-                }
-            };
             while let Some(unit_res) = unit_new_stream.next().await {
                 match unit_res {
                     Ok(args) => {
@@ -126,6 +142,18 @@ impl DBusContext<'static> {
                 }
             }
         });
+        Ok((drain_handle, rx_unit_new_args))
+    }
+
+    fn watch_units(
+        &self,
+        units_lock: UnitList,
+        mut rx_unit_new_args: tokio::sync::mpsc::UnboundedReceiver<NewUnitArgs>,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::mpsc::Receiver<NewUnit>,
+    ) {
+        let (tx_new_unit, rx_new_unit) = tokio::sync::mpsc::channel::<NewUnit>(100);
         let units_lock_new_clone = units_lock.clone();
         let self_new_clone = self.clone();
         let process_handle = tokio::spawn(async move {
@@ -174,7 +202,7 @@ impl DBusContext<'static> {
                 }
             }
         });
-        (vec![drain_handle, process_handle], rx_new_unit)
+        (process_handle, rx_new_unit)
     }
 
     pub async fn get_messages(
@@ -683,6 +711,7 @@ mod tests {
             id: "new.service".to_string(),
             unit: "/obj/path".to_string(),
         };
+        mock_manager.expect_list_units().return_once(|| Ok(vec![]));
         mock_manager.expect_receive_unit_new().return_once(move || {
             Ok(Box::pin(futures::stream::iter(vec![Ok(args)]))
                 as Pin<Box<dyn Stream<Item = Result<NewUnitArgs>> + Send>>)
@@ -700,9 +729,7 @@ mod tests {
         mock_fs.add_file("/lib/systemd/system/new.service", "[X-Traefik]\nLabel=new");
 
         let context = DBusContext::new_test_context(Arc::new(mock_manager), mock_fs);
-        let units_lock = Arc::new(RwLock::new(HashMap::new()));
-
-        let (handles, mut rx_new_unit) = context.watch_units(units_lock.clone()).await;
+        let (units_lock, handles, mut rx_new_unit) = context.load_and_watch_units().await.unwrap();
 
         let event =
             tokio::time::timeout(tokio::time::Duration::from_millis(500), rx_new_unit.recv())
@@ -735,6 +762,7 @@ mod tests {
             id: "ghost.service".to_string(),
             unit: "/obj/path".to_string(),
         };
+        mock_manager.expect_list_units().return_once(|| Ok(vec![]));
         mock_manager.expect_receive_unit_new().return_once(move || {
             Ok(Box::pin(futures::stream::iter(vec![Ok(args1), Ok(args2)]))
                 as Pin<Box<dyn Stream<Item = Result<NewUnitArgs>> + Send>>)
@@ -755,9 +783,7 @@ mod tests {
         let mock_fs = Arc::new(MockFileSystem::new());
 
         let context = DBusContext::new_test_context(Arc::new(mock_manager), mock_fs);
-        let units_lock = Arc::new(RwLock::new(HashMap::new()));
-
-        let (handles, _rx_new_unit) = context.watch_units(units_lock.clone()).await;
+        let (units_lock, handles, _rx_new_unit) = context.load_and_watch_units().await.unwrap();
 
         // The stream is finite, so the watch task ends once both events are drained.
         for h in handles {
@@ -774,6 +800,62 @@ mod tests {
         );
         let units = units_lock.read().await;
         assert!(!units.contains_key("ghost.service"));
+    }
+
+    #[tokio::test]
+    async fn test_load_and_watch_units_announces_unit_loaded_while_listing() {
+        type Subscriber = futures::channel::mpsc::UnboundedSender<Result<NewUnitArgs>>;
+        let subscriber: Arc<std::sync::Mutex<Option<Subscriber>>> = Default::default();
+        let mut mock_manager = MockSystemdManager::new();
+
+        let subscriber_clone = subscriber.clone();
+        mock_manager.expect_receive_unit_new().return_once(move || {
+            let (tx, rx) = futures::channel::mpsc::unbounded();
+            *subscriber_clone.lock().unwrap() = Some(tx);
+            Ok(Box::pin(rx) as UnitNewStream)
+        });
+
+        // systemd only announces UnitNew to whoever is subscribed at that moment.
+        let subscriber_clone = subscriber.clone();
+        mock_manager.expect_list_units().return_once(move || {
+            if let Some(tx) = subscriber_clone.lock().unwrap().as_ref() {
+                tx.unbounded_send(Ok(NewUnitArgs {
+                    id: "late.service".to_string(),
+                    unit: "/obj/path".to_string(),
+                }))
+                .unwrap();
+            }
+            Ok(vec![])
+        });
+
+        mock_manager.expect_get_unit().returning(|_| {
+            let mut u = MockSystemdUnit::new();
+            u.expect_drop_in_paths().returning(|| Ok(vec![]));
+            u.expect_fragment_path()
+                .returning(|| Ok("/lib/systemd/system/late.service".to_string()));
+            Ok(Box::new(u))
+        });
+
+        let mock_fs = Arc::new(MockFileSystem::new());
+        mock_fs.add_file(
+            "/lib/systemd/system/late.service",
+            "[X-Traefik]\nLabel=late",
+        );
+
+        let context = DBusContext::new_test_context(Arc::new(mock_manager), mock_fs);
+        let (units_lock, handles, mut rx_new_unit) = context.load_and_watch_units().await.unwrap();
+
+        let event =
+            tokio::time::timeout(tokio::time::Duration::from_millis(500), rx_new_unit.recv())
+                .await
+                .expect("unit loaded while listing units was never announced")
+                .expect("Channel closed before receiving event");
+        assert_eq!(event.unit, "late.service");
+        assert!(units_lock.read().await.contains_key("late.service"));
+
+        for h in handles {
+            h.abort();
+        }
     }
 
     type UnitNewStream = Pin<Box<dyn Stream<Item = Result<NewUnitArgs>> + Send>>;
@@ -804,7 +886,7 @@ mod tests {
                 zbus::zvariant::OwnedObjectPath,
             )>,
         > {
-            unimplemented!()
+            Ok(vec![])
         }
 
         async fn receive_unit_new(&self) -> Result<UnitNewStream> {
@@ -840,8 +922,7 @@ mod tests {
         let mock_fs = Arc::new(MockFileSystem::new());
         mock_fs.add_file("/web.service", "[X-Traefik]\nLabel=web");
         let context = DBusContext::new_test_context(Arc::new(manager), mock_fs);
-        let units_lock = Arc::new(RwLock::new(HashMap::new()));
-        let (handles, mut rx_new_unit) = context.watch_units(units_lock.clone()).await;
+        let (units_lock, handles, mut rx_new_unit) = context.load_and_watch_units().await.unwrap();
 
         // A burst of UnitNew signals, larger than the queue, like systemd emits on daemon-reload.
         let socket_reader = tokio::spawn(async move {

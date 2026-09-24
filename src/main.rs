@@ -47,7 +47,7 @@ async fn run(traefik_dir: std::path::PathBuf) -> Result<()> {
     info!("Traefik dynamic output dir: {}", traefik_dir.display());
 
     let dbus = DBusContext::new().await?;
-    let watched = dbus.list_units().await?;
+    let (watched, watch_join_handles, rx_new_unit) = dbus.load_and_watch_units().await?;
     if log_enabled!(log::Level::Info) {
         let read = watched.read().await;
         let watched_units = read.keys().cloned().collect::<Vec<_>>();
@@ -57,8 +57,6 @@ async fn run(traefik_dir: std::path::PathBuf) -> Result<()> {
             info!("Initial watched units: {}", watched_units.join(", "));
         }
     }
-    let (watch_join_handles, rx_new_unit) = dbus.watch_units(watched.clone()).await;
-
     if let Err(e) = reconcile(&dbus, &watched, fs.as_ref(), &traefik_dir).await {
         error!("initial reconcile error: {:#}", e);
     }
