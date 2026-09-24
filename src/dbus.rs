@@ -341,7 +341,6 @@ impl DBusContext<'static> {
         let mut streamed_units = units.iter().cloned().collect::<HashSet<_>>();
         let initial_watched_units_count = units.len();
         debug!("Watching {} units.", initial_watched_units_count);
-        let mut has_initial_units = initial_watched_units_count > 0;
         let streams_of_changes = units
             .into_iter()
             .async_map(|unit_name| async move { self.create_changes_stream(unit_name).await })
@@ -349,26 +348,13 @@ impl DBusContext<'static> {
             .into_iter()
             .flatten();
         let mut changes_stream = futures::stream::select_all(streams_of_changes);
-        let mut done = false;
+        let mut has_streams = !changes_stream.is_empty();
         use tokio::signal::unix::{SignalKind, signal};
-        let mut sigint = match signal(SignalKind::interrupt()) {
-            Err(err) => {
-                eprintln!("Error listening for SIGINT (Ctrl+C) signal: {err}");
-                std::process::exit(1);
-            }
-            Ok(sigint) => sigint,
-        };
-        let mut sigterm = match signal(SignalKind::terminate()) {
-            Err(err) => {
-                eprintln!("Error listening for SIGTERM signal: {err}");
-                std::process::exit(1);
-            }
-            Ok(sigterm) => sigterm,
-        };
+        let mut sigint =
+            signal(SignalKind::interrupt()).context("listening for SIGINT (Ctrl+C) signal")?;
+        let mut sigterm =
+            signal(SignalKind::terminate()).context("listening for SIGTERM signal")?;
         loop {
-            if done {
-                break;
-            }
             tokio::select! {
                 event = rx_watch_events.recv() => {
                     match event {
@@ -380,47 +366,43 @@ impl DBusContext<'static> {
                             info!("New unit being wached: {}", unit_name);
                             let new_unit_changes_stream = self.create_changes_stream(unit_name).await;
                             changes_stream.extend(new_unit_changes_stream);
-                            has_initial_units  = true;
+                            has_streams = !changes_stream.is_empty();
                         }
-                        Some(WatchEvent::Job(job)) => {
-                            match tx_new_job_event.send(job).await {
-                                Err(e) => error!("Error sending message: {:#}", e),
-                                Ok(_) => trace!("Message sent to channel"),
-                            }
-                        }
-                        None => {
-                            trace!("Watch events channel closed");
-                            done = true;
-                        }
+                        Some(WatchEvent::Job(job)) => send_job(&tx_new_job_event, job).await?,
+                        None => anyhow::bail!("the unit watcher stopped"),
                     }
                 }
-                property_changed_fut_opt = changes_stream.next(), if has_initial_units => {
-                    if let Some(property_changed_fut) = property_changed_fut_opt {
-                        let job = match property_changed_fut.await {
-                            Some(the_job) => the_job,
-                            None => continue,
-                        };
-                        match tx_new_job_event.send(job).await {
-                            Err(e) => error!("Error sending message: {:#}", e),
-                            Ok(_) => trace!("Message sent to channel"),
-                        }
-                    } else {
-                        trace!("Changes streams closed");
-                        done = true;
+                property_changed_fut_opt = changes_stream.next(), if has_streams => {
+                    let Some(property_changed_fut) = property_changed_fut_opt else {
+                        anyhow::bail!("all unit state streams closed");
+                    };
+                    if let Some(job) = property_changed_fut.await {
+                        send_job(&tx_new_job_event, job).await?;
                     }
                 }
                 _ = sigint.recv() => {
                     trace!("SIGINT (Ctrl+C) received, stopping...");
-                    done = true;
+                    return Ok(());
                 }
                 _ = sigterm.recv() => {
                     trace!("SIGTERM received, stopping...");
-                    done = true;
+                    return Ok(());
                 }
             };
         }
-        Ok(())
     }
+}
+
+async fn send_job(
+    tx_new_job_event: &tokio::sync::mpsc::Sender<JobEvent>,
+    job: JobEvent,
+) -> Result<()> {
+    tx_new_job_event
+        .send(job)
+        .await
+        .context("the job processing stopped")?;
+    trace!("Message sent to channel");
+    Ok(())
 }
 
 async fn send_watch_event(
@@ -1218,6 +1200,33 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_get_messages_fails_when_job_processing_stopped() {
+        let (tx_job, rx_job) = tokio::sync::mpsc::channel(10);
+        drop(rx_job);
+        let (tx_watch_events, rx_watch_events) = tokio::sync::mpsc::channel(10);
+        let job = JobEvent {
+            unit_name: "web.service".to_string(),
+            started: true,
+        };
+        tx_watch_events.send(WatchEvent::Job(job)).await.unwrap();
+        let context = DBusContext::new_test_context(
+            Arc::new(MockSystemdManager::new()),
+            Arc::new(MockFileSystem::new()),
+        );
+
+        let error = context
+            .get_messages(
+                tx_job,
+                Arc::new(RwLock::new(HashMap::new())),
+                rx_watch_events,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "the job processing stopped");
+    }
+
     #[allow(clippy::type_complexity)]
     fn list_units_row(
         name: &str,
@@ -1367,7 +1376,7 @@ mod tests {
         context
             .get_messages(tx_job, units_lock, rx_watch_events)
             .await
-            .unwrap();
+            .expect_err("a closed watcher channel must be an error");
 
         assert_eq!(
             rx_job.recv().await,
@@ -1391,10 +1400,11 @@ mod tests {
         mock_manager.expect_get_unit().returning(|_| {
             let mut u = MockSystemdUnit::new();
             u.expect_receive_active_state_changed().return_once(|| {
-                Ok(
-                    Box::pin(futures::stream::iter(vec![Ok("active".to_string())]))
-                        as Pin<Box<dyn Stream<Item = Result<String>> + Send>>,
+                Ok(Box::pin(
+                    futures::stream::iter(vec![Ok("active".to_string())])
+                        .chain(futures::stream::pending()),
                 )
+                    as Pin<Box<dyn Stream<Item = Result<String>> + Send>>)
             });
             Ok(Box::new(u))
         });
@@ -1422,8 +1432,9 @@ mod tests {
         assert_eq!(job.unit_name, "new.service");
         assert!(job.started);
 
-        drop(tx_new_unit); // Now we can drop it to close rx_new_unit in get_messages
-        handle.await.unwrap().unwrap();
+        drop(tx_new_unit);
+        let error = handle.await.unwrap().unwrap_err();
+        assert_eq!(error.to_string(), "the unit watcher stopped");
     }
 
     fn setup(

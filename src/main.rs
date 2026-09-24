@@ -23,7 +23,7 @@ use crate::{
     infra::{FileSystem, RealFileSystem},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use std::sync::Arc;
 
@@ -64,17 +64,45 @@ async fn run(traefik_dir: std::path::PathBuf) -> Result<()> {
     let (tx_new_job_event, process_msgs_join_handle) =
         process_service_change_messages(watched.clone(), dbus.clone(), fs.clone(), &traefik_dir)
             .await?;
-    dbus.get_messages(tx_new_job_event, watched, rx_watch_events)
-        .await?; // will block
-
-    trace!("Shutting down");
-    for handle in watch_join_handles
+    let background_tasks = watch_join_handles
         .into_iter()
         .chain([process_msgs_join_handle])
-    {
-        handle.abort();
-    }
+        .collect();
+    supervise(
+        dbus.get_messages(tx_new_job_event, watched, rx_watch_events),
+        background_tasks,
+    )
+    .await?;
+    trace!("Shutting down");
     Ok(())
+}
+
+/// Runs the main loop until it ends, failing if any background task ends first: they are all
+/// meant to live as long as the process, and one that stops means updates silently stop too.
+/// Failing lets systemd restart the service.
+async fn supervise(
+    main_loop: impl Future<Output = Result<()>>,
+    background_tasks: Vec<tokio::task::JoinHandle<()>>,
+) -> Result<()> {
+    if background_tasks.is_empty() {
+        return main_loop.await;
+    }
+    let abort_handles = background_tasks
+        .iter()
+        .map(|task| task.abort_handle())
+        .collect::<Vec<_>>();
+    let result = tokio::select! {
+        biased;
+        result = main_loop => result,
+        (task_result, _, _) = futures::future::select_all(background_tasks) => match task_result {
+            Ok(()) => Err(anyhow!("a background task stopped unexpectedly")),
+            Err(e) => Err(anyhow!("a background task failed: {e}")),
+        },
+    };
+    for abort_handle in abort_handles {
+        abort_handle.abort();
+    }
+    result
 }
 
 #[cfg(test)]
@@ -92,4 +120,41 @@ mod tests {
             }
         }
     };
+
+    #[tokio::test]
+    async fn test_supervise_fails_when_a_background_task_panics() {
+        let panicking_task = tokio::spawn(async { panic!("boom") });
+        let error = supervise(std::future::pending(), vec![panicking_task])
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().starts_with("a background task failed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_supervise_fails_when_a_background_task_returns() {
+        let returning_task = tokio::spawn(async {});
+        let error = supervise(std::future::pending(), vec![returning_task])
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "a background task stopped unexpectedly");
+    }
+
+    #[tokio::test]
+    async fn test_supervise_stops_background_tasks_when_main_loop_ends() {
+        let (tx_alive, rx_alive) = tokio::sync::oneshot::channel::<()>();
+        let long_running_task = tokio::spawn(async move {
+            let _tx_alive = tx_alive;
+            std::future::pending::<()>().await
+        });
+        supervise(async { Ok(()) }, vec![long_running_task])
+            .await
+            .unwrap();
+        assert!(
+            rx_alive.await.is_err(),
+            "the background task should have been aborted"
+        );
+    }
 }
