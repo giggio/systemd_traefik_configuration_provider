@@ -92,6 +92,7 @@
               "rust-analyzer"
             ])
             cargo-nextest
+            rumdl
             yq-go
             gnumake
             zbus-xmlgen

@@ -47,6 +47,10 @@ jobs:
       - name: Test and lint x86_64
         run: |
           nix build .#x86_64_test .#x86_64_clippy --print-build-logs
+      - name: Lint markdown
+        run: |
+          source <(nix print-dev-env . --verbose)
+          rumdl check
       - name: Build x86_64
         run: |
           source <(nix print-dev-env . --verbose)
