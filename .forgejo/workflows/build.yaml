@@ -21,7 +21,6 @@ on:
       - .editorconfig
       - ".forgejo/**"
       - .gitignore
-
 env:
   CI_RUN: ${{ forgejo.server_url != '' && '1' || '' }}
 jobs:
@@ -29,7 +28,7 @@ jobs:
     name: cargo build
     runs-on: docker
     container:
-      # derived from nixos/nix:2.32.8
+      # derived from nixos/nix:2.35.2
       image: giggio/nixaction
     steps:
       - uses: actions/checkout@v4

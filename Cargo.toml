@@ -27,9 +27,9 @@ zbus = "5"
 zvariant = "5"
 
 [dev-dependencies]
-ctor = "0.6.3"
-mockall = "0.14"
+ctor = "1.0.13"
+mockall = "0.15"
 pretty_assertions = "1.4.1"
 proptest = "1.9.0"
-serial_test = "3.3.1"
+serial_test = "4.0.1"
 tempfile = "3"
