@@ -232,7 +232,9 @@ pub trait Unit {
     fn documentation(&self) -> zbus::Result<Vec<String>>;
 
     /// DropInPaths property
-    #[zbus(property)]
+    // systemd declares it `const`, but it changes on daemon-reload (on NixOS every rebuild
+    // moves drop-ins to a new store path), so it is never cached.
+    #[zbus(property(emits_changed_signal = "false"))]
     fn drop_in_paths(&self) -> zbus::Result<Vec<String>>;
 
     /// FailureAction property
@@ -248,7 +250,9 @@ pub trait Unit {
     fn following(&self) -> zbus::Result<String>;
 
     /// FragmentPath property
-    #[zbus(property)]
+    // systemd declares it `const`, but it changes on daemon-reload (on NixOS every rebuild
+    // moves drop-ins to a new store path), so it is never cached.
+    #[zbus(property(emits_changed_signal = "false"))]
     fn fragment_path(&self) -> zbus::Result<String>;
 
     /// FreezerState property

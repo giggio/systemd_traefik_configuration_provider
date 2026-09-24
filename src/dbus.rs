@@ -956,6 +956,83 @@ mod tests {
         }
     }
 
+    /// Serves `org.freedesktop.systemd1.Unit` the way systemd does: the file paths are declared
+    /// `const`, so no PropertiesChanged is ever sent when they change on daemon-reload.
+    struct FakeSystemdUnitObject {
+        drop_in_paths: Arc<std::sync::Mutex<Vec<String>>>,
+        fragment_path: Arc<std::sync::Mutex<String>>,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.systemd1.Unit")]
+    impl FakeSystemdUnitObject {
+        #[zbus(property(emits_changed_signal = "const"))]
+        fn drop_in_paths(&self) -> Vec<String> {
+            self.drop_in_paths.lock().unwrap().clone()
+        }
+
+        #[zbus(property(emits_changed_signal = "const"))]
+        fn fragment_path(&self) -> String {
+            self.fragment_path.lock().unwrap().clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_real_unit_reads_file_paths_changed_by_daemon_reload() {
+        const UNIT_PATH: &str = "/org/freedesktop/systemd1/unit/web_2eservice";
+        let drop_in_paths = Arc::new(std::sync::Mutex::new(vec![
+            "/nix/store/old/web.conf".into(),
+        ]));
+        let fragment_path = Arc::new(std::sync::Mutex::new("/nix/store/old/web.service".into()));
+        let (server_stream, client_stream) = std::os::unix::net::UnixStream::pair().unwrap();
+        let server = zbus::connection::Builder::async_io_unix_stream(server_stream)
+            .server(zbus::Guid::generate())
+            .unwrap()
+            .p2p()
+            .serve_at(
+                UNIT_PATH,
+                FakeSystemdUnitObject {
+                    drop_in_paths: drop_in_paths.clone(),
+                    fragment_path: fragment_path.clone(),
+                },
+            )
+            .unwrap()
+            .build();
+        let client = zbus::connection::Builder::async_io_unix_stream(client_stream)
+            .p2p()
+            .build();
+        let (_server, client) = futures::try_join!(server, client).unwrap();
+        let unit = RealSystemdUnit {
+            proxy: crate::unit::UnitProxy::builder(&client)
+                .path(UNIT_PATH)
+                .unwrap()
+                .build()
+                .await
+                .unwrap(),
+        };
+        assert_eq!(
+            unit.drop_in_paths().await.unwrap(),
+            vec!["/nix/store/old/web.conf"]
+        );
+        assert_eq!(
+            unit.fragment_path().await.unwrap(),
+            "/nix/store/old/web.service"
+        );
+
+        *drop_in_paths.lock().unwrap() = vec!["/nix/store/new/web.conf".into()];
+        *fragment_path.lock().unwrap() = "/nix/store/new/web.service".into();
+
+        assert_eq!(
+            unit.drop_in_paths().await.unwrap(),
+            vec!["/nix/store/new/web.conf"],
+            "DropInPaths was served from a stale cache"
+        );
+        assert_eq!(
+            unit.fragment_path().await.unwrap(),
+            "/nix/store/new/web.service",
+            "FragmentPath was served from a stale cache"
+        );
+    }
+
     #[tokio::test]
     async fn test_get_messages() {
         let (tx_job, mut rx_job) = tokio::sync::mpsc::channel(10);

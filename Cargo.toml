@@ -33,3 +33,4 @@ pretty_assertions = "1.4.1"
 proptest = "1.9.0"
 serial_test = "4.0.1"
 tempfile = "3"
+zbus = { version = "5", features = ["p2p"] }
