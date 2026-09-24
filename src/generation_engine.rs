@@ -57,12 +57,14 @@ pub async fn reconcile(
         .keys()
         .cloned()
         .collect::<Vec<_>>();
-    prune_orphan_yamls(&tracked_units, fs, traefik_dir).context("pruning orphan unit yamls")
+    prune_orphan_yamls(&tracked_units, fs, traefik_dir)
+        .await
+        .context("pruning orphan unit yamls")
 }
 
 /// Removes generated files of units that are no longer tracked, e.g. removed or stripped of
 /// their Traefik config while the daemon was not running.
-fn prune_orphan_yamls<'a>(
+async fn prune_orphan_yamls<'a>(
     tracked_units: impl IntoIterator<Item = &'a String>,
     fs: &dyn FileSystem,
     traefik_dir: &Path,
@@ -71,16 +73,17 @@ fn prune_orphan_yamls<'a>(
         .into_iter()
         .map(|unit| unit_yaml_path(unit, traefik_dir))
         .collect::<HashSet<_>>();
-    for path in fs.list_files(traefik_dir)? {
+    for path in fs.list_files(traefik_dir).await? {
         if path.extension().is_none_or(|extension| extension != "yml")
             || tracked_paths.contains(&path)
             || !fs
                 .read_to_string(&path)
+                .await
                 .is_ok_and(|content| content.starts_with(GENERATED_MARKER))
         {
             continue;
         }
-        if let Err(e) = fs.remove_file(&path) {
+        if let Err(e) = fs.remove_file(&path).await {
             error!("Error removing orphan {}: {:#}", path.display(), e);
             continue;
         }
@@ -121,7 +124,7 @@ pub async fn process_service_change_messages(
             } else {
                 // a unit dropped from tracking (e.g. lost its Traefik config) still needs its
                 // yaml removed, so this does not depend on the unit data
-                remove_unit_yaml(&job.unit_name, fs.as_ref(), &traefik_dir)
+                remove_unit_yaml(&job.unit_name, fs.as_ref(), &traefik_dir).await
             };
             if let Err(e) = result {
                 error!("Error handling service state change message: {:#}", e);
@@ -149,14 +152,14 @@ pub async fn handle_service_state_changed(
             .get_traefik_yaml_config_from_configuration_files(unit_data)
             .await?;
         let yaml_config = build_traefik_file_yaml(lines)?;
-        write_unit_yaml(&unit_data.name, yaml_config, fs, traefik_dir)?;
+        write_unit_yaml(&unit_data.name, yaml_config, fs, traefik_dir).await?;
     } else {
-        remove_unit_yaml(&unit_data.name, fs, traefik_dir)?;
+        remove_unit_yaml(&unit_data.name, fs, traefik_dir).await?;
     }
     Ok(())
 }
 
-fn write_unit_yaml(
+async fn write_unit_yaml(
     unit: &str,
     yaml: String,
     fs: &dyn FileSystem,
@@ -165,9 +168,10 @@ fn write_unit_yaml(
     let dest = unit_yaml_path(unit, traefik_dir);
     let content = format!("{GENERATED_MARKER}{yaml}");
 
-    if fs.exists(&dest)
+    if fs.exists(&dest).await
         && fs
             .read_to_string(&dest)
+            .await
             .is_ok_and(|current| current == content)
     {
         trace!("Unit yaml for {} at {} is up to date", unit, dest.display());
@@ -175,17 +179,17 @@ fn write_unit_yaml(
     }
 
     trace!("Unit yaml for {} at {} is {yaml}", unit, dest.display());
-    fs.write(&dest, &content)?;
+    fs.write(&dest, &content).await?;
     info!("Wrote {}", dest.display());
     Ok(())
 }
 
-fn remove_unit_yaml(unit: &str, fs: &dyn FileSystem, traefik_dir: &Path) -> Result<()> {
+async fn remove_unit_yaml(unit: &str, fs: &dyn FileSystem, traefik_dir: &Path) -> Result<()> {
     let dest = unit_yaml_path(unit, traefik_dir);
-    if !fs.exists(&dest) {
+    if !fs.exists(&dest).await {
         return Ok(());
     }
-    fs.remove_file(&dest)?;
+    fs.remove_file(&dest).await?;
     info!("Removed {}", dest.display());
     Ok(())
 }
@@ -197,8 +201,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
 
-    #[test]
-    fn test_write_unit_yaml_creates_file() {
+    #[tokio::test]
+    async fn test_write_unit_yaml_creates_file() {
         let fs = MockFileSystem::new();
         write_unit_yaml(
             "test.service",
@@ -206,6 +210,7 @@ mod tests {
             &fs,
             Path::new("/traefik"),
         )
+        .await
         .unwrap();
         assert_eq!(
             fs.get_file_content("/traefik/test.service.yml").unwrap(),
@@ -213,8 +218,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_write_unit_yaml_sanitizes_filename() {
+    #[tokio::test]
+    async fn test_write_unit_yaml_sanitizes_filename() {
         let fs = MockFileSystem::new();
         write_unit_yaml(
             "my@app!service.service",
@@ -222,6 +227,7 @@ mod tests {
             &fs,
             Path::new("/traefik"),
         )
+        .await
         .unwrap();
         assert_eq!(
             fs.get_file_content("/traefik/my@app_service.service.yml")
@@ -230,27 +236,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_write_unit_yaml_replaces_changed_content() {
+    #[tokio::test]
+    async fn test_write_unit_yaml_replaces_changed_content() {
         let fs = MockFileSystem::new();
         let traefik_dir = PathBuf::from("/traefik");
         fs.add_file("/traefik/test.service.yml", "old");
-        write_unit_yaml("test.service", "new".to_string(), &fs, &traefik_dir).unwrap();
+        write_unit_yaml("test.service", "new".to_string(), &fs, &traefik_dir)
+            .await
+            .unwrap();
         assert_eq!(
             fs.get_file_content("/traefik/test.service.yml").unwrap(),
             format!("{GENERATED_MARKER}new")
         );
     }
 
-    #[test]
-    fn test_write_unit_yaml_does_not_rewrite_unchanged_content() {
+    #[tokio::test]
+    async fn test_write_unit_yaml_does_not_rewrite_unchanged_content() {
         let fs = MockFileSystem::new();
         let traefik_dir = PathBuf::from("/traefik");
         fs.add_file(
             "/traefik/test.service.yml",
             format!("{GENERATED_MARKER}same"),
         );
-        write_unit_yaml("test.service", "same".to_string(), &fs, &traefik_dir).unwrap();
+        write_unit_yaml("test.service", "same".to_string(), &fs, &traefik_dir)
+            .await
+            .unwrap();
         assert_eq!(fs.write_count(), 0);
     }
 
@@ -519,11 +529,13 @@ mod tests {
         assert!(fs.file_exists_in_memory("/traefik/notes.txt"));
     }
 
-    #[test]
-    fn test_prune_orphan_yamls_keeps_tracked_units() {
+    #[tokio::test]
+    async fn test_prune_orphan_yamls_keeps_tracked_units() {
         let fs = MockFileSystem::new();
         fs.add_file("/traefik/my@app.service.yml", GENERATED_MARKER);
-        prune_orphan_yamls([&"my@app.service".to_string()], &fs, Path::new("/traefik")).unwrap();
+        prune_orphan_yamls([&"my@app.service".to_string()], &fs, Path::new("/traefik"))
+            .await
+            .unwrap();
         assert!(fs.file_exists_in_memory("/traefik/my@app.service.yml"));
     }
 
@@ -556,25 +568,33 @@ mod tests {
         assert!(!fs.file_exists_in_memory("/traefik/gone.service.yml"));
     }
 
-    #[test]
-    fn test_remove_unit_yaml_deletes_file() {
+    #[tokio::test]
+    async fn test_remove_unit_yaml_deletes_file() {
         let fs = MockFileSystem::new();
         fs.add_file("/traefik/test.service.yml", "dummy content");
-        remove_unit_yaml("test.service", &fs, Path::new("/traefik")).unwrap();
+        remove_unit_yaml("test.service", &fs, Path::new("/traefik"))
+            .await
+            .unwrap();
         assert!(!fs.file_exists_in_memory("/traefik/test.service.yml"));
     }
 
-    #[test]
-    fn test_remove_unit_yaml_nonexistent_file() {
+    #[tokio::test]
+    async fn test_remove_unit_yaml_nonexistent_file() {
         let fs = MockFileSystem::new();
-        assert!(remove_unit_yaml("nonexistent.service", &fs, Path::new("/traefik")).is_ok());
+        assert!(
+            remove_unit_yaml("nonexistent.service", &fs, Path::new("/traefik"))
+                .await
+                .is_ok()
+        );
     }
 
-    #[test]
-    fn test_remove_unit_yaml_sanitizes_filename() {
+    #[tokio::test]
+    async fn test_remove_unit_yaml_sanitizes_filename() {
         let fs = MockFileSystem::new();
         fs.add_file("/traefik/my@app_service.service.yml", "dummy content");
-        remove_unit_yaml("my@app!service.service", &fs, Path::new("/traefik")).unwrap();
+        remove_unit_yaml("my@app!service.service", &fs, Path::new("/traefik"))
+            .await
+            .unwrap();
         assert!(!fs.file_exists_in_memory("/traefik/my@app_service.service.yml"));
     }
 }

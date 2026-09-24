@@ -622,15 +622,14 @@ impl<'a> DBusContext<'a> {
     }
 
     async fn get_config_files_for_unit(&self, unit_data: &UnitData) -> Result<Vec<String>> {
-        let mut all_paths: Vec<_> = unit_data
-            .proxy
-            .drop_in_paths()
-            .await?
-            .into_iter()
-            .filter(|p| self.fs.exists(std::path::Path::new(&p)))
-            .collect();
+        let mut all_paths = vec![];
+        for drop_in_path in unit_data.proxy.drop_in_paths().await? {
+            if self.fs.exists(Path::new(&drop_in_path)).await {
+                all_paths.push(drop_in_path);
+            }
+        }
         let fragment_path = unit_data.proxy.fragment_path().await?;
-        if self.fs.exists(std::path::Path::new(&fragment_path)) {
+        if self.fs.exists(Path::new(&fragment_path)).await {
             all_paths.push(fragment_path);
         }
         if all_paths.is_empty() {
@@ -653,7 +652,7 @@ impl<'a> DBusContext<'a> {
         let files = self.get_config_files_for_unit(unit_data).await?;
         for file in &files {
             trace!("Checking config file {}", file);
-            let text = self.fs.read_to_string(Path::new(file))?;
+            let text = self.fs.read_to_string(Path::new(file)).await?;
             let parser = systemd_lsp::SystemdParser::new();
             let unit_config = parser.parse(&text);
             if unit_config.sections.contains_key("X-Traefik") {
@@ -670,7 +669,7 @@ impl<'a> DBusContext<'a> {
     ) -> Result<Vec<String>> {
         let mut lines = vec![];
         for file in &files {
-            let text = self.fs.read_to_string(Path::new(file))?;
+            let text = self.fs.read_to_string(Path::new(file)).await?;
             let parser = systemd_lsp::SystemdParser::new();
             let unit_config = parser.parse(&text);
             if let Some(section) = unit_config.sections.get("X-Traefik") {

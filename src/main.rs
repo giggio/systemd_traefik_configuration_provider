@@ -40,6 +40,7 @@ async fn main() -> std::result::Result<(), String> {
 async fn run(traefik_dir: std::path::PathBuf) -> Result<()> {
     let fs = Arc::new(RealFileSystem);
     fs.create_dir_all(&traefik_dir)
+        .await
         .context("creating traefik dynamic output dir")?;
     info!("Traefik dynamic output dir: {}", traefik_dir.display());
 
