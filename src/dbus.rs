@@ -54,6 +54,46 @@ pub enum WatchEvent {
     Job(JobEvent),
 }
 
+/// Transient units get unique names (`run-p4049-i1187.service`, one per `systemd-run`), so the
+/// ignored names would only grow between reloads without a cap.
+const MAX_IGNORED_UNITS: usize = 10_000;
+
+/// Names already inspected and found to carry no Traefik config. systemd emits a fresh UnitNew
+/// every time a not-found unit is re-materialized, and inspecting it re-materializes it, so
+/// without this cache a single ghost reference would make the daemon probe it forever in a tight
+/// loop. That is also why names are not dropped on UnitRemoved: the removal of a ghost is
+/// followed by the UnitNew caused by our own probe. When full it is cleared, which costs at most
+/// one more probe per unit seen again.
+struct IgnoredUnits {
+    names: HashSet<String>,
+    capacity: usize,
+}
+
+impl IgnoredUnits {
+    fn new(capacity: usize) -> Self {
+        Self {
+            names: HashSet::new(),
+            capacity,
+        }
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
+
+    fn insert(&mut self, name: String) {
+        if self.names.len() >= self.capacity {
+            debug!("Ignored units cache is full, clearing it");
+            self.names.clear();
+        }
+        self.names.insert(name);
+    }
+
+    fn clear(&mut self) {
+        self.names.clear();
+    }
+}
+
 enum UnitSignal {
     New(NewUnitArgs),
     Reloaded,
@@ -204,11 +244,7 @@ impl DBusContext<'static> {
         let (tx_watch_events, rx_watch_events) = tokio::sync::mpsc::channel::<WatchEvent>(100);
         let self_clone = self.clone();
         let process_handle = tokio::spawn(async move {
-            // Names already inspected and found to carry no Traefik config. systemd emits a
-            // fresh UnitNew every time a not-found unit is re-materialized, and inspecting it
-            // re-materializes it, so without this cache a single ghost reference would make the
-            // daemon probe it forever in a tight loop.
-            let mut ignored: HashSet<String> = HashSet::new();
+            let mut ignored = IgnoredUnits::new(MAX_IGNORED_UNITS);
             while let Some(signal) = rx_unit_signals.recv().await {
                 match signal {
                     UnitSignal::New(args) => {
@@ -232,7 +268,7 @@ impl DBusContext<'static> {
         &self,
         args: NewUnitArgs,
         units_lock: &UnitList,
-        ignored: &mut HashSet<String>,
+        ignored: &mut IgnoredUnits,
         tx_watch_events: &tokio::sync::mpsc::Sender<WatchEvent>,
     ) {
         let name = args.id;
@@ -271,7 +307,7 @@ impl DBusContext<'static> {
     async fn resync_units(
         &self,
         units_lock: &UnitList,
-        ignored: &mut HashSet<String>,
+        ignored: &mut IgnoredUnits,
         tx_watch_events: &tokio::sync::mpsc::Sender<WatchEvent>,
     ) {
         ignored.clear();
@@ -723,6 +759,20 @@ mod tests {
     use super::*;
     use crate::infra::tests::MockFileSystem;
     use std::sync::Arc;
+
+    #[test]
+    fn test_ignored_units_are_cleared_when_full() {
+        let mut ignored = IgnoredUnits::new(2);
+        ignored.insert("a.service".to_string());
+        ignored.insert("b.service".to_string());
+        assert!(ignored.contains("a.service") && ignored.contains("b.service"));
+
+        ignored.insert("c.service".to_string());
+
+        assert!(!ignored.contains("a.service"));
+        assert!(!ignored.contains("b.service"));
+        assert!(ignored.contains("c.service"));
+    }
 
     fn expect_subscriptions(mock_manager: &mut MockSystemdManager) {
         mock_manager
