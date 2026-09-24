@@ -114,7 +114,12 @@ fn write_unit_yaml(
     let sanitized_filename = sanitize_filename(unit);
     let dest = traefik_dir.join(format!("{}.yml", sanitized_filename));
 
-    if fs.exists(&dest) {
+    if fs.exists(&dest)
+        && fs
+            .read_to_string(&dest)
+            .is_ok_and(|current| current == yaml)
+    {
+        trace!("Unit yaml for {} at {} is up to date", unit, dest.display());
         return Ok(());
     }
 
@@ -190,16 +195,25 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_write_unit_yaml_idempotent() {
-        let temp_dir = TempDir::new().unwrap();
-        let canonical_temp_path = temp_dir.path().canonicalize().unwrap();
+    fn test_write_unit_yaml_replaces_changed_content() {
         let fs = MockFileSystem::new();
-        write_unit_yaml("test.service", "foo".to_string(), &fs, &canonical_temp_path).unwrap();
-        let yaml_path = canonical_temp_path.join("test.service.yml");
-        let content1 = fs.get_file_content(yaml_path.to_str().unwrap()).unwrap();
-        write_unit_yaml("test.service", "foo".to_string(), &fs, &canonical_temp_path).unwrap();
-        let content2 = fs.get_file_content(yaml_path.to_str().unwrap()).unwrap();
-        assert_eq!(content1, content2);
+        let traefik_dir = PathBuf::from("/traefik");
+        fs.add_file("/traefik/test.service.yml", "old");
+        write_unit_yaml("test.service", "new".to_string(), &fs, &traefik_dir).unwrap();
+        assert_eq!(
+            fs.get_file_content("/traefik/test.service.yml").unwrap(),
+            "new"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_write_unit_yaml_does_not_rewrite_unchanged_content() {
+        let fs = MockFileSystem::new();
+        let traefik_dir = PathBuf::from("/traefik");
+        fs.add_file("/traefik/test.service.yml", "same");
+        write_unit_yaml("test.service", "same".to_string(), &fs, &traefik_dir).unwrap();
+        assert_eq!(fs.write_count(), 0);
     }
 
     #[test]

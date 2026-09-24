@@ -57,16 +57,21 @@ pub mod tests {
     use super::*;
     use anyhow::bail;
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     pub struct MockFileSystem {
         files: Arc<Mutex<HashMap<String, String>>>,
+        write_count: AtomicUsize,
     }
 
     impl MockFileSystem {
         pub fn new() -> Self {
             Self {
                 files: Arc::new(Mutex::new(HashMap::new())),
+                write_count: AtomicUsize::new(0),
             }
         }
 
@@ -79,6 +84,10 @@ pub mod tests {
 
         pub fn get_file_content(&self, path: impl AsRef<str>) -> Option<String> {
             self.files.lock().unwrap().get(path.as_ref()).cloned()
+        }
+
+        pub fn write_count(&self) -> usize {
+            self.write_count.load(Ordering::SeqCst)
         }
 
         pub fn file_exists_in_memory(&self, path: impl AsRef<str>) -> bool {
@@ -97,6 +106,7 @@ pub mod tests {
         }
 
         fn write(&self, path: &Path, contents: &str) -> Result<()> {
+            self.write_count.fetch_add(1, Ordering::SeqCst);
             let mut files = self.files.lock().unwrap();
             let path_str = path.to_str().ok_or_else(|| anyhow!("Invalid path"))?;
             files.insert(path_str.to_string(), contents.to_string());
