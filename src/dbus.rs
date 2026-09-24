@@ -27,15 +27,24 @@ pub struct UnitData {
     pub name: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct JobEvent {
     pub unit_name: String,
     pub started: bool,
 }
 
-#[derive(Debug)]
-pub struct NewUnit {
-    pub unit: String,
+/// What the unit watcher asks the main loop to do.
+#[derive(Debug, PartialEq)]
+pub enum WatchEvent {
+    /// Follow the ActiveState of a newly tracked unit.
+    Watch(String),
+    /// Generate or remove a unit's yaml without an ActiveState change, e.g. after a reload.
+    Job(JobEvent),
+}
+
+enum UnitSignal {
+    New(NewUnitArgs),
+    Reloaded,
 }
 
 pub struct NewUnitArgs {
@@ -72,9 +81,11 @@ pub trait SystemdManager: Send + Sync {
             zbus::zvariant::OwnedObjectPath,
         )>,
     >;
+    async fn subscribe(&self) -> Result<()>;
     async fn receive_unit_new(
         &self,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<NewUnitArgs>> + Send>>>;
+    async fn receive_reloading(&self) -> Result<Pin<Box<dyn Stream<Item = Result<bool>> + Send>>>;
     async fn load_unit(&self, name: &str) -> Result<String>;
     async fn get_unit(&self, path: String) -> Result<Box<dyn SystemdUnit>>;
 }
@@ -98,9 +109,14 @@ impl DBusContext<'static> {
     ) -> Result<(
         UnitList,
         Vec<tokio::task::JoinHandle<()>>,
-        tokio::sync::mpsc::Receiver<NewUnit>,
+        tokio::sync::mpsc::Receiver<WatchEvent>,
     )> {
-        let (drain_handle, rx_unit_new_args) = self.drain_unit_new().await?;
+        // systemd only emits unit signals on the system bus while some client is subscribed.
+        self.manager
+            .subscribe()
+            .await
+            .context("subscribing to systemd signals")?;
+        let (drain_handle, rx_unit_signals) = self.drain_unit_signals().await?;
         let units_lock = match self.list_units().await {
             Ok(units_lock) => units_lock,
             Err(e) => {
@@ -108,110 +124,211 @@ impl DBusContext<'static> {
                 return Err(e);
             }
         };
-        let (process_handle, rx_new_unit) = self.watch_units(units_lock.clone(), rx_unit_new_args);
-        Ok((units_lock, vec![drain_handle, process_handle], rx_new_unit))
+        let (process_handle, rx_watch_events) =
+            self.watch_units(units_lock.clone(), rx_unit_signals);
+        Ok((
+            units_lock,
+            vec![drain_handle, process_handle],
+            rx_watch_events,
+        ))
     }
 
     /// zbus stops reading the socket (method replies included) while any signal stream's
-    /// queue is full, so the UnitNew stream must never wait on D-Bus calls made while
+    /// queue is full, so the signal streams must never wait on D-Bus calls made while
     /// inspecting a unit, or a burst of UnitNew (e.g. on daemon-reload) deadlocks the
-    /// connection. It is drained into an unbounded channel on its own task instead.
-    async fn drain_unit_new(
+    /// connection. They are drained into an unbounded channel on their own task instead.
+    async fn drain_unit_signals(
         &self,
     ) -> Result<(
         tokio::task::JoinHandle<()>,
-        tokio::sync::mpsc::UnboundedReceiver<NewUnitArgs>,
+        tokio::sync::mpsc::UnboundedReceiver<UnitSignal>,
     )> {
-        let mut unit_new_stream = self
+        let unit_new_stream = self
             .manager
             .receive_unit_new()
             .await
-            .context("receiving unit new stream")?;
-        let (tx_unit_new_args, rx_unit_new_args) =
-            tokio::sync::mpsc::unbounded_channel::<NewUnitArgs>();
+            .context("receiving unit new stream")?
+            .map(|unit_res| unit_res.map(UnitSignal::New));
+        let reloaded_stream = self
+            .manager
+            .receive_reloading()
+            .await
+            .context("receiving reloading stream")?
+            .filter_map(|reloading_res| {
+                std::future::ready(match reloading_res {
+                    // the units are only consistent once the reload finishes
+                    Ok(true) => None,
+                    Ok(false) => Some(Ok(UnitSignal::Reloaded)),
+                    Err(e) => Some(Err(e)),
+                })
+            });
+        let mut signals = futures::stream::select(unit_new_stream, reloaded_stream);
+        let (tx_unit_signals, rx_unit_signals) =
+            tokio::sync::mpsc::unbounded_channel::<UnitSignal>();
         let drain_handle = tokio::spawn(async move {
-            while let Some(unit_res) = unit_new_stream.next().await {
-                match unit_res {
-                    Ok(args) => {
-                        if tx_unit_new_args.send(args).is_err() {
-                            trace!("Unit new args channel closed");
+            while let Some(signal_res) = signals.next().await {
+                match signal_res {
+                    Ok(signal) => {
+                        if tx_unit_signals.send(signal).is_err() {
+                            trace!("Unit signals channel closed");
                             return;
                         }
                     }
-                    Err(e) => error!("Error getting unit args: {:#}", e),
+                    Err(e) => error!("Error getting unit signal: {:#}", e),
                 }
             }
         });
-        Ok((drain_handle, rx_unit_new_args))
+        Ok((drain_handle, rx_unit_signals))
     }
 
     fn watch_units(
         &self,
         units_lock: UnitList,
-        mut rx_unit_new_args: tokio::sync::mpsc::UnboundedReceiver<NewUnitArgs>,
+        mut rx_unit_signals: tokio::sync::mpsc::UnboundedReceiver<UnitSignal>,
     ) -> (
         tokio::task::JoinHandle<()>,
-        tokio::sync::mpsc::Receiver<NewUnit>,
+        tokio::sync::mpsc::Receiver<WatchEvent>,
     ) {
-        let (tx_new_unit, rx_new_unit) = tokio::sync::mpsc::channel::<NewUnit>(100);
-        let units_lock_new_clone = units_lock.clone();
-        let self_new_clone = self.clone();
+        let (tx_watch_events, rx_watch_events) = tokio::sync::mpsc::channel::<WatchEvent>(100);
+        let self_clone = self.clone();
         let process_handle = tokio::spawn(async move {
             // Names already inspected and found to carry no Traefik config. systemd emits a
             // fresh UnitNew every time a not-found unit is re-materialized, and inspecting it
             // re-materializes it, so without this cache a single ghost reference would make the
             // daemon probe it forever in a tight loop.
             let mut ignored: HashSet<String> = HashSet::new();
-            while let Some(args) = rx_unit_new_args.recv().await {
-                let name = args.id.clone();
-                if ignored.contains(&name) {
-                    continue;
-                }
-                {
-                    let units = units_lock_new_clone.read().await;
-                    if units.contains_key(&name) {
-                        trace!("Already watching unit {}", name);
-                        continue;
-                    } else {
-                        trace!("Watching unit {}", name);
+            while let Some(signal) = rx_unit_signals.recv().await {
+                match signal {
+                    UnitSignal::New(args) => {
+                        self_clone
+                            .track_new_unit(args, &units_lock, &mut ignored, &tx_watch_events)
+                            .await
                     }
-                }
-                match self_new_clone
-                    .create_unit(name.clone(), args.unit.clone())
-                    .await
-                {
-                    UnitCreation::Tracked(unit_data) => {
-                        let mut units = units_lock_new_clone.write().await;
-                        let unit_name = unit_data.name.clone();
-                        trace!("Adding unit {} to watched list", unit_name);
-                        units.insert(unit_name.clone(), unit_data);
-                        if let Err(e) = tx_new_unit.send(NewUnit { unit: unit_name }).await {
-                            error!("Error sending new unit event: {:#}", e);
-                        }
-                    }
-                    UnitCreation::Untracked => {
-                        trace!("Did not create unit {}", name);
-                        ignored.insert(name);
-                    }
-                    UnitCreation::Failed => {
-                        trace!(
-                            "Did not create unit {} (inspection failed, will retry)",
-                            name
-                        );
+                    UnitSignal::Reloaded => {
+                        info!("systemd reloaded, checking units again");
+                        self_clone
+                            .resync_units(&units_lock, &mut ignored, &tx_watch_events)
+                            .await
                     }
                 }
             }
         });
-        (process_handle, rx_new_unit)
+        (process_handle, rx_watch_events)
+    }
+
+    async fn track_new_unit(
+        &self,
+        args: NewUnitArgs,
+        units_lock: &UnitList,
+        ignored: &mut HashSet<String>,
+        tx_watch_events: &tokio::sync::mpsc::Sender<WatchEvent>,
+    ) {
+        let name = args.id;
+        if ignored.contains(&name) {
+            return;
+        }
+        if units_lock.read().await.contains_key(&name) {
+            trace!("Already watching unit {}", name);
+            return;
+        }
+        trace!("Watching unit {}", name);
+        match self.create_unit(name.clone(), args.unit).await {
+            UnitCreation::Tracked(unit_data) => {
+                trace!("Adding unit {} to watched list", name);
+                units_lock.write().await.insert(name.clone(), unit_data);
+                send_watch_event(tx_watch_events, WatchEvent::Watch(name)).await;
+            }
+            UnitCreation::Untracked => {
+                trace!("Did not create unit {}", name);
+                ignored.insert(name);
+            }
+            UnitCreation::Failed => {
+                trace!(
+                    "Did not create unit {} (inspection failed, will retry)",
+                    name
+                );
+            }
+        }
+    }
+
+    /// A daemon-reload can add or remove the Traefik config of any unit, or change its labels,
+    /// without an ActiveState change, so every loaded or tracked unit is inspected again.
+    async fn resync_units(
+        &self,
+        units_lock: &UnitList,
+        ignored: &mut HashSet<String>,
+        tx_watch_events: &tokio::sync::mpsc::Sender<WatchEvent>,
+    ) {
+        ignored.clear();
+        let mut candidates = match self.manager.list_units().await {
+            Ok(units) => units
+                .into_iter()
+                .map(|unit| (unit.0, unit.6.to_string()))
+                .collect::<HashMap<_, _>>(),
+            Err(e) => {
+                error!("Error listing units after reload: {:#}", e);
+                return;
+            }
+        };
+        let tracked_names = units_lock.read().await.keys().cloned().collect::<Vec<_>>();
+        for name in tracked_names {
+            if candidates.contains_key(&name) {
+                continue;
+            }
+            match self.manager.load_unit(&name).await {
+                Ok(object_path) => {
+                    candidates.insert(name, object_path);
+                }
+                Err(e) => error!("Error loading unit {name} after reload: {:#}", e),
+            }
+        }
+        for (name, object_path) in candidates {
+            let was_tracked = units_lock.read().await.contains_key(&name);
+            match self.create_unit(name.clone(), object_path).await {
+                UnitCreation::Tracked(unit_data) => {
+                    let started = match unit_data.proxy.active_state().await {
+                        Ok(state) => state == "active",
+                        Err(e) => {
+                            error!("Error getting state of unit {name} after reload: {:#}", e);
+                            continue;
+                        }
+                    };
+                    units_lock.write().await.insert(name.clone(), unit_data);
+                    if !was_tracked {
+                        info!("Unit {} now has Traefik config", name);
+                        send_watch_event(tx_watch_events, WatchEvent::Watch(name.clone())).await;
+                    }
+                    let job = JobEvent {
+                        unit_name: name,
+                        started,
+                    };
+                    send_watch_event(tx_watch_events, WatchEvent::Job(job)).await;
+                }
+                UnitCreation::Untracked => {
+                    if was_tracked {
+                        info!("Unit {} no longer has Traefik config", name);
+                        units_lock.write().await.remove(&name);
+                        let job = JobEvent {
+                            unit_name: name.clone(),
+                            started: false,
+                        };
+                        send_watch_event(tx_watch_events, WatchEvent::Job(job)).await;
+                    }
+                    ignored.insert(name);
+                }
+                UnitCreation::Failed => {}
+            }
+        }
     }
 
     pub async fn get_messages(
         &self,
         tx_new_job_event: tokio::sync::mpsc::Sender<JobEvent>,
         watched_map: UnitList,
-        mut rx_new_unit: tokio::sync::mpsc::Receiver<NewUnit>,
+        mut rx_watch_events: tokio::sync::mpsc::Receiver<WatchEvent>,
     ) -> Result<()> {
         let units = watched_map.read().await.keys().cloned().collect::<Vec<_>>();
+        let mut streamed_units = units.iter().cloned().collect::<HashSet<_>>();
         let initial_watched_units_count = units.len();
         debug!("Watching {} units.", initial_watched_units_count);
         let mut has_initial_units = initial_watched_units_count > 0;
@@ -243,15 +360,28 @@ impl DBusContext<'static> {
                 break;
             }
             tokio::select! {
-                event = rx_new_unit.recv() => {
-                    if let Some(event) = event {
-                        info!("New unit being wached: {}", event.unit);
-                        let new_unit_changes_stream = self.create_changes_stream(event.unit).await;
-                        changes_stream.extend(new_unit_changes_stream);
-                        has_initial_units  = true;
-                    } else {
-                        trace!("New unit channel closed");
-                        done = true;
+                event = rx_watch_events.recv() => {
+                    match event {
+                        Some(WatchEvent::Watch(unit_name)) => {
+                            if !streamed_units.insert(unit_name.clone()) {
+                                trace!("Already following state of unit {}", unit_name);
+                                continue;
+                            }
+                            info!("New unit being wached: {}", unit_name);
+                            let new_unit_changes_stream = self.create_changes_stream(unit_name).await;
+                            changes_stream.extend(new_unit_changes_stream);
+                            has_initial_units  = true;
+                        }
+                        Some(WatchEvent::Job(job)) => {
+                            match tx_new_job_event.send(job).await {
+                                Err(e) => error!("Error sending message: {:#}", e),
+                                Ok(_) => trace!("Message sent to channel"),
+                            }
+                        }
+                        None => {
+                            trace!("Watch events channel closed");
+                            done = true;
+                        }
                     }
                 }
                 property_changed_fut_opt = changes_stream.next(), if has_initial_units => {
@@ -280,6 +410,15 @@ impl DBusContext<'static> {
             };
         }
         Ok(())
+    }
+}
+
+async fn send_watch_event(
+    tx_watch_events: &tokio::sync::mpsc::Sender<WatchEvent>,
+    event: WatchEvent,
+) {
+    if let Err(e) = tx_watch_events.send(event).await {
+        error!("Error sending watch event: {:#}", e);
     }
 }
 
@@ -525,6 +664,19 @@ impl SystemdManager for RealSystemdManager<'static> {
         Ok(self.proxy.list_units().await?)
     }
 
+    async fn subscribe(&self) -> Result<()> {
+        Ok(self.proxy.subscribe().await?)
+    }
+
+    async fn receive_reloading(&self) -> Result<Pin<Box<dyn Stream<Item = Result<bool>> + Send>>> {
+        let stream = self.proxy.receive_reloading().await?;
+        Ok(Box::pin(stream.map(|msg| {
+            let args = msg.args().map_err(|e| anyhow::anyhow!(e))?;
+            Ok(*args.active())
+        }))
+            as Pin<Box<dyn Stream<Item = Result<bool>> + Send>>)
+    }
+
     async fn receive_unit_new(
         &self,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<NewUnitArgs>> + Send>>> {
@@ -588,6 +740,16 @@ mod tests {
     use super::*;
     use crate::infra::tests::MockFileSystem;
     use std::sync::Arc;
+
+    fn expect_subscriptions(mock_manager: &mut MockSystemdManager) {
+        mock_manager
+            .expect_subscribe()
+            .times(1)
+            .return_once(|| Ok(()));
+        mock_manager
+            .expect_receive_reloading()
+            .return_once(|| Ok(Box::pin(futures::stream::empty())));
+    }
 
     #[tokio::test]
     async fn test_is_unit_running() {
@@ -712,6 +874,7 @@ mod tests {
             unit: "/obj/path".to_string(),
         };
         mock_manager.expect_list_units().return_once(|| Ok(vec![]));
+        expect_subscriptions(&mut mock_manager);
         mock_manager.expect_receive_unit_new().return_once(move || {
             Ok(Box::pin(futures::stream::iter(vec![Ok(args)]))
                 as Pin<Box<dyn Stream<Item = Result<NewUnitArgs>> + Send>>)
@@ -736,7 +899,7 @@ mod tests {
                 .await
                 .expect("Timeout waiting for new unit event")
                 .expect("Channel closed before receiving event");
-        assert_eq!(event.unit, "new.service");
+        assert_eq!(event, WatchEvent::Watch("new.service".to_string()));
 
         let units = units_lock.read().await;
         assert!(units.contains_key("new.service"));
@@ -763,6 +926,7 @@ mod tests {
             unit: "/obj/path".to_string(),
         };
         mock_manager.expect_list_units().return_once(|| Ok(vec![]));
+        expect_subscriptions(&mut mock_manager);
         mock_manager.expect_receive_unit_new().return_once(move || {
             Ok(Box::pin(futures::stream::iter(vec![Ok(args1), Ok(args2)]))
                 as Pin<Box<dyn Stream<Item = Result<NewUnitArgs>> + Send>>)
@@ -809,6 +973,7 @@ mod tests {
         let mut mock_manager = MockSystemdManager::new();
 
         let subscriber_clone = subscriber.clone();
+        expect_subscriptions(&mut mock_manager);
         mock_manager.expect_receive_unit_new().return_once(move || {
             let (tx, rx) = futures::channel::mpsc::unbounded();
             *subscriber_clone.lock().unwrap() = Some(tx);
@@ -850,7 +1015,7 @@ mod tests {
                 .await
                 .expect("unit loaded while listing units was never announced")
                 .expect("Channel closed before receiving event");
-        assert_eq!(event.unit, "late.service");
+        assert_eq!(event, WatchEvent::Watch("late.service".to_string()));
         assert!(units_lock.read().await.contains_key("late.service"));
 
         for h in handles {
@@ -887,6 +1052,16 @@ mod tests {
             )>,
         > {
             Ok(vec![])
+        }
+
+        async fn subscribe(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn receive_reloading(
+            &self,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<bool>> + Send>>> {
+            Ok(Box::pin(futures::stream::empty()))
         }
 
         async fn receive_unit_new(&self) -> Result<UnitNewStream> {
@@ -947,7 +1122,7 @@ mod tests {
         .await
         .expect("deadlock: unit inspection waited on a reply stuck behind the full UnitNew queue")
         .expect("Channel closed before receiving event");
-        assert_eq!(event.unit, "web.service");
+        assert_eq!(event, WatchEvent::Watch("web.service".to_string()));
         assert!(units_lock.read().await.contains_key("web.service"));
 
         socket_reader.abort();
@@ -1033,6 +1208,166 @@ mod tests {
         );
     }
 
+    #[allow(clippy::type_complexity)]
+    fn list_units_row(
+        name: &str,
+        object_path: &str,
+    ) -> (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        zbus::zvariant::OwnedObjectPath,
+        u32,
+        String,
+        zbus::zvariant::OwnedObjectPath,
+    ) {
+        let object_path = zbus::zvariant::OwnedObjectPath::try_from(object_path).unwrap();
+        (
+            name.to_string(),
+            "".into(),
+            "loaded".into(),
+            "active".into(),
+            "running".into(),
+            "".into(),
+            object_path.clone(),
+            0,
+            "".into(),
+            object_path,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_reload_checks_units_again() {
+        let mock_fs = Arc::new(MockFileSystem::new());
+        mock_fs.add_file("/units/losing", "[X-Traefik]\nLabel=a");
+        mock_fs.add_file("/units/gaining", "[Service]");
+        mock_fs.add_file("/units/keeping", "[X-Traefik]\nLabel=c");
+
+        let mut mock_manager = MockSystemdManager::new();
+        mock_manager.expect_subscribe().return_once(|| Ok(()));
+        let (tx_reloading, rx_reloading) = futures::channel::mpsc::unbounded::<Result<bool>>();
+        mock_manager
+            .expect_receive_reloading()
+            .return_once(move || Ok(Box::pin(rx_reloading)));
+        mock_manager
+            .expect_receive_unit_new()
+            .return_once(|| Ok(Box::pin(futures::stream::pending()) as UnitNewStream));
+        mock_manager.expect_list_units().returning(|| {
+            Ok(["losing", "gaining", "keeping"]
+                .map(|name| list_units_row(&format!("{name}.service"), &format!("/obj/{name}")))
+                .to_vec())
+        });
+        mock_manager.expect_get_unit().returning(|object_path| {
+            let fragment_path = object_path.replace("/obj/", "/units/");
+            let mut u = MockSystemdUnit::new();
+            u.expect_drop_in_paths().returning(|| Ok(vec![]));
+            u.expect_fragment_path()
+                .returning(move || Ok(fragment_path.clone()));
+            u.expect_active_state()
+                .returning(|| Ok("active".to_string()));
+            Ok(Box::new(u))
+        });
+
+        let context = DBusContext::new_test_context(Arc::new(mock_manager), mock_fs.clone());
+        let (units_lock, handles, mut rx_watch_events) =
+            context.load_and_watch_units().await.unwrap();
+        let mut tracked = units_lock.read().await.keys().cloned().collect::<Vec<_>>();
+        tracked.sort();
+        assert_eq!(tracked, vec!["keeping.service", "losing.service"]);
+
+        mock_fs.add_file("/units/losing", "[Service]");
+        mock_fs.add_file("/units/gaining", "[X-Traefik]\nLabel=b");
+        tx_reloading.unbounded_send(Ok(true)).unwrap();
+        tx_reloading.unbounded_send(Ok(false)).unwrap();
+
+        let mut events = vec![];
+        for _ in 0..4 {
+            let event = tokio::time::timeout(
+                tokio::time::Duration::from_millis(500),
+                rx_watch_events.recv(),
+            )
+            .await
+            .expect("Timeout waiting for watch event")
+            .expect("Channel closed before receiving event");
+            events.push(event);
+        }
+        let job = |unit_name: &str, started| {
+            WatchEvent::Job(JobEvent {
+                unit_name: unit_name.to_string(),
+                started,
+            })
+        };
+        for expected in [
+            WatchEvent::Watch("gaining.service".to_string()),
+            job("gaining.service", true),
+            job("keeping.service", true),
+            job("losing.service", false),
+        ] {
+            assert!(
+                events.contains(&expected),
+                "missing {expected:?} in {events:?}"
+            );
+        }
+        let mut tracked = units_lock.read().await.keys().cloned().collect::<Vec<_>>();
+        tracked.sort();
+        assert_eq!(tracked, vec!["gaining.service", "keeping.service"]);
+
+        for h in handles {
+            h.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_messages_forwards_jobs_and_follows_each_unit_once() {
+        let (tx_job, mut rx_job) = tokio::sync::mpsc::channel(10);
+        let (tx_watch_events, rx_watch_events) = tokio::sync::mpsc::channel(10);
+
+        let mut mock_manager = MockSystemdManager::new();
+        mock_manager
+            .expect_load_unit()
+            .returning(|_| Ok("/obj/path/new".to_string()));
+        mock_manager.expect_get_unit().times(1).returning(|_| {
+            let mut u = MockSystemdUnit::new();
+            u.expect_receive_active_state_changed().return_once(|| {
+                Ok(Box::pin(futures::stream::pending())
+                    as Pin<Box<dyn Stream<Item = Result<String>> + Send>>)
+            });
+            Ok(Box::new(u))
+        });
+        let context =
+            DBusContext::new_test_context(Arc::new(mock_manager), Arc::new(MockFileSystem::new()));
+
+        let job = JobEvent {
+            unit_name: "gone.service".to_string(),
+            started: false,
+        };
+        for event in [
+            WatchEvent::Watch("new.service".to_string()),
+            WatchEvent::Watch("new.service".to_string()),
+            WatchEvent::Job(job),
+        ] {
+            tx_watch_events.send(event).await.unwrap();
+        }
+        drop(tx_watch_events);
+
+        let units_lock = Arc::new(RwLock::new(HashMap::new()));
+        context
+            .get_messages(tx_job, units_lock, rx_watch_events)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rx_job.recv().await,
+            Some(JobEvent {
+                unit_name: "gone.service".to_string(),
+                started: false,
+            })
+        );
+    }
+
     #[tokio::test]
     async fn test_get_messages() {
         let (tx_job, mut rx_job) = tokio::sync::mpsc::channel(10);
@@ -1059,9 +1394,7 @@ mod tests {
         let units_lock = Arc::new(RwLock::new(HashMap::new()));
 
         tx_new_unit
-            .send(NewUnit {
-                unit: "new.service".to_string(),
-            })
+            .send(WatchEvent::Watch("new.service".to_string()))
             .await
             .unwrap();
 

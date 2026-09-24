@@ -54,25 +54,23 @@ pub async fn process_service_change_messages(
     let traefik_dir = traefik_dir.to_owned();
     let handle = tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
-            let units = watched.read().await;
-            let unit_data = if let Some(unit_data) = units.get(&job.unit_name) {
-                unit_data
+            let result = if job.started {
+                let units = watched.read().await;
+                let Some(unit_data) = units.get(&job.unit_name) else {
+                    debug!(
+                        "Not generating yaml for unit {}, it is not tracked.",
+                        job.unit_name
+                    );
+                    continue;
+                };
+                handle_service_state_changed(&dbus, true, unit_data, fs.as_ref(), &traefik_dir)
+                    .await
             } else {
-                error!(
-                    "Not handling PropertiesChanged for unit {}, missing unit data.",
-                    job.unit_name
-                );
-                continue;
+                // a unit dropped from tracking (e.g. lost its Traefik config) still needs its
+                // yaml removed, so this does not depend on the unit data
+                remove_unit_yaml(&job.unit_name, fs.as_ref(), &traefik_dir)
             };
-            if let Err(e) = handle_service_state_changed(
-                &dbus,
-                job.started,
-                unit_data,
-                fs.as_ref(),
-                &traefik_dir,
-            )
-            .await
-            {
+            if let Err(e) = result {
                 error!("Error handling service state change message: {:#}", e);
             } else {
                 trace!("Message handled");
@@ -214,6 +212,35 @@ mod tests {
         fs.add_file("/traefik/test.service.yml", "same");
         write_unit_yaml("test.service", "same".to_string(), &fs, &traefik_dir).unwrap();
         assert_eq!(fs.write_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_stop_job_removes_yaml_of_untracked_unit() {
+        let fs = Arc::new(MockFileSystem::new());
+        fs.add_file("/traefik/gone.service.yml", "old");
+        let dbus = DBusContext::new_test_context(
+            Arc::new(crate::dbus::MockSystemdManager::new()),
+            fs.clone(),
+        );
+        let (tx, handle) = process_service_change_messages(
+            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            dbus,
+            fs.clone(),
+            Path::new("/traefik"),
+        )
+        .await
+        .unwrap();
+
+        tx.send(JobEvent {
+            unit_name: "gone.service".to_string(),
+            started: false,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        assert!(!fs.file_exists_in_memory("/traefik/gone.service.yml"));
     }
 
     #[test]

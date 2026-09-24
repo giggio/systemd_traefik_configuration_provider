@@ -47,7 +47,7 @@ async fn run(traefik_dir: std::path::PathBuf) -> Result<()> {
     info!("Traefik dynamic output dir: {}", traefik_dir.display());
 
     let dbus = DBusContext::new().await?;
-    let (watched, watch_join_handles, rx_new_unit) = dbus.load_and_watch_units().await?;
+    let (watched, watch_join_handles, rx_watch_events) = dbus.load_and_watch_units().await?;
     if log_enabled!(log::Level::Info) {
         let read = watched.read().await;
         let watched_units = read.keys().cloned().collect::<Vec<_>>();
@@ -64,7 +64,7 @@ async fn run(traefik_dir: std::path::PathBuf) -> Result<()> {
     let (tx_new_job_event, process_msgs_join_handle) =
         process_service_change_messages(watched.clone(), dbus.clone(), fs.clone(), &traefik_dir)
             .await?;
-    dbus.get_messages(tx_new_job_event, watched, rx_new_unit)
+    dbus.get_messages(tx_new_job_event, watched, rx_watch_events)
         .await?; // will block
 
     trace!("Shutting down");
