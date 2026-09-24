@@ -23,17 +23,14 @@ pub fn start(level_filter: LevelFilter, hide_date: bool) -> Result<LoggerHandle>
         }
         logger = logger.adaptive_format_for_stdout(AdaptiveFormat::Detailed); // shows line numbers
     } else {
-        logger = logger.format(if std::io::stdout().is_terminal() {
-            if hide_date {
-                colored_detailed_format_no_date
-            } else {
-                colored_detailed_format
-            }
-        } else if hide_date {
-            detailed_format_no_date
-        } else {
-            detailed_format
-        });
+        let format: flexi_logger::FormatFunction =
+            match (std::io::stdout().is_terminal(), hide_date) {
+                (true, false) => detailed_format::<true, true>,
+                (true, true) => detailed_format::<false, true>,
+                (false, false) => detailed_format::<true, false>,
+                (false, true) => detailed_format::<false, false>,
+            };
+        logger = logger.format(format);
     }
     let logger_handle = logger.start()?;
     if cargo_run {
@@ -42,71 +39,36 @@ pub fn start(level_filter: LevelFilter, hide_date: bool) -> Result<LoggerHandle>
     Ok(logger_handle)
 }
 
-// adapted from flexi_logger:
-fn detailed_format(
-    w: &mut dyn std::io::Write,
-    now: &mut DeferredNow,
-    record: &Record,
-) -> std::result::Result<(), std::io::Error> {
-    write!(
-        w,
-        "[{}] {} [{}]: ",
-        now.format(TS_DASHES_BLANK_COLONS_DOT_BLANK),
-        record.level(),
-        record.module_path().unwrap_or("<unnamed>"),
-    )?;
-
-    write_key_value_pairs(w, record)?;
-
-    write!(w, "{}", record.args())
-}
-fn colored_detailed_format(
+// adapted from flexi_logger. The flags are const generics because flexi_logger takes a plain
+// function pointer, so each combination is its own function.
+fn detailed_format<const SHOW_DATE: bool, const COLORED: bool>(
     w: &mut dyn std::io::Write,
     now: &mut DeferredNow,
     record: &Record,
 ) -> std::result::Result<(), std::io::Error> {
     let level = record.level();
-    write!(
-        w,
-        "[{}] {} [{}]: ",
-        style(level).paint(now.format(TS_DASHES_BLANK_COLONS_DOT_BLANK).to_string()),
-        style(level).paint(record.level().to_string()),
-        record.module_path().unwrap_or("<unnamed>"),
-    )?;
-    write_key_value_pairs(w, record)?;
-    write!(w, "{}", style(level).paint(record.args().to_string()))
-}
-
-fn detailed_format_no_date(
-    w: &mut dyn std::io::Write,
-    _now: &mut DeferredNow,
-    record: &Record,
-) -> std::result::Result<(), std::io::Error> {
-    write!(
-        w,
-        "{} [{}]: ",
-        record.level(),
-        record.module_path().unwrap_or("<unnamed>"),
-    )?;
-
-    write_key_value_pairs(w, record)?;
-
-    write!(w, "{}", record.args())
-}
-fn colored_detailed_format_no_date(
-    w: &mut dyn std::io::Write,
-    _now: &mut DeferredNow,
-    record: &Record,
-) -> std::result::Result<(), std::io::Error> {
-    let level = record.level();
+    let paint = |text: String| {
+        if COLORED {
+            style(level).paint(text).to_string()
+        } else {
+            text
+        }
+    };
+    if SHOW_DATE {
+        write!(
+            w,
+            "[{}] ",
+            paint(now.format(TS_DASHES_BLANK_COLONS_DOT_BLANK).to_string())
+        )?;
+    }
     write!(
         w,
         "{} [{}]: ",
-        style(level).paint(record.level().to_string()),
+        paint(level.to_string()),
         record.module_path().unwrap_or("<unnamed>"),
     )?;
     write_key_value_pairs(w, record)?;
-    write!(w, "{}", style(level).paint(record.args().to_string()))
+    write!(w, "{}", paint(record.args().to_string()))
 }
 
 // originally from flexi_logger:
@@ -145,4 +107,57 @@ where
 pub enum Error {
     #[error(transparent)]
     Logger(#[from] flexi_logger::FlexiLoggerError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    fn format_with(
+        format: fn(
+            &mut dyn std::io::Write,
+            &mut DeferredNow,
+            &Record,
+        ) -> std::result::Result<(), std::io::Error>,
+    ) -> String {
+        let mut out = Vec::new();
+        format(
+            &mut out,
+            &mut DeferredNow::new(),
+            &Record::builder()
+                .level(log::Level::Info)
+                .module_path(Some("app::module"))
+                .args(format_args!("hello"))
+                .build(),
+        )
+        .unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn test_detailed_format_without_date() {
+        assert_eq!(
+            format_with(detailed_format::<false, false>),
+            "INFO [app::module]: hello"
+        );
+    }
+
+    #[test]
+    fn test_detailed_format_with_date() {
+        let formatted = format_with(detailed_format::<true, false>);
+        assert!(formatted.starts_with('['), "{formatted}");
+        assert!(
+            formatted.ends_with("] INFO [app::module]: hello"),
+            "{formatted}"
+        );
+    }
+
+    #[test]
+    fn test_detailed_format_colored_keeps_the_text() {
+        let formatted = format_with(detailed_format::<false, true>);
+        assert!(formatted.contains("INFO"), "{formatted}");
+        assert!(formatted.contains(" [app::module]: "), "{formatted}");
+        assert!(formatted.contains("hello"), "{formatted}");
+    }
 }
