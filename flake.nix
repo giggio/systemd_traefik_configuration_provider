@@ -74,11 +74,16 @@
                 }/bin/systemd_traefik_configuration_provider $out/bin/systemd_traefik_configuration_provider_aarch64
               '';
         };
-        # needs KVM: nix build .#checks.x86_64-linux.e2e
+        # e2e needs KVM, e2e-no-kvm is the same test emulated (slower), which is what CI runs
         checks = lib.optionalAttrs (system == "x86_64-linux") {
           e2e = import ./e2e-test.nix {
             inherit pkgs;
             package = self.packages.${system}.x86_64;
+          };
+          e2e-no-kvm = import ./e2e-test.nix {
+            inherit pkgs;
+            package = self.packages.${system}.x86_64;
+            kvm = false;
           };
         };
         devShells.default = pkgs.mkShell {

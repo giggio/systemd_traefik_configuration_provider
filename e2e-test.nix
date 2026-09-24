@@ -1,6 +1,18 @@
-{ pkgs, package }:
+{
+  pkgs,
+  package,
+  # Without KVM, QEMU falls back to emulation (TCG), which works but is several times slower. That is how CI runs it,
+  # on runners that have no /dev/kvm.
+  kvm ? true,
+}:
+let
+  # seconds to wait for the provider to react
+  timeout = if kvm then 30 else 300;
+in
 pkgs.testers.runNixOSTest {
-  name = "systemd_traefik_configuration_provider-e2e";
+  name = "systemd_traefik_configuration_provider-e2e${if kvm then "" else "-no-kvm"}";
+
+  requiredFeatures.kvm = kvm;
 
   nodes.machine = {
     systemd.services.systemd_traefik_configuration_provider = {
@@ -37,36 +49,36 @@ pkgs.testers.runNixOSTest {
         traefik_drop_in("10-traefik-a", "a.example")
         reload()
         machine.succeed("systemctl start web.service")
-        machine.wait_until_succeeds(f"grep -F 'Host(`a.example`)' {yml}", timeout=30)
+        machine.wait_until_succeeds(f"grep -F 'Host(`a.example`)' {yml}", timeout=${toString timeout})
         machine.succeed(f"head -1 {yml} | grep -qxF '{marker}'")
 
     with subtest("a drop-in moved to a new path is read again on reload"):
         machine.succeed("rm /run/systemd/system/web.service.d/10-traefik-a.conf")
         traefik_drop_in("20-traefik-b", "b.example")
         reload()
-        machine.wait_until_succeeds(f"grep -F 'Host(`b.example`)' {yml}", timeout=30)
+        machine.wait_until_succeeds(f"grep -F 'Host(`b.example`)' {yml}", timeout=${toString timeout})
         machine.fail(f"grep -F 'a.example' {yml}")
 
     with subtest("a unit that loses its Traefik config on reload loses its file"):
         machine.succeed("rm /run/systemd/system/web.service.d/20-traefik-b.conf")
         reload()
-        machine.wait_until_fails(f"test -e {yml}", timeout=30)
+        machine.wait_until_fails(f"test -e {yml}", timeout=${toString timeout})
 
     with subtest("a unit that gains Traefik config on reload gets its file"):
         traefik_drop_in("30-traefik-c", "c.example")
         reload()
-        machine.wait_until_succeeds(f"grep -F 'Host(`c.example`)' {yml}", timeout=30)
+        machine.wait_until_succeeds(f"grep -F 'Host(`c.example`)' {yml}", timeout=${toString timeout})
 
     with subtest("stopping the unit removes its file"):
         machine.succeed("systemctl stop web.service")
-        machine.wait_until_fails(f"test -e {yml}", timeout=30)
+        machine.wait_until_fails(f"test -e {yml}", timeout=${toString timeout})
 
     with subtest("generated orphans are pruned on startup, other files are kept"):
         machine.succeed("systemctl stop systemd_traefik_configuration_provider.service")
         write(f"{out}/gone.service.yml", f"{marker}\nhttp: {{}}")
         write(f"{out}/handwritten.yml", "http: {}")
         machine.succeed("systemctl start systemd_traefik_configuration_provider.service")
-        machine.wait_until_fails(f"test -e {out}/gone.service.yml", timeout=30)
+        machine.wait_until_fails(f"test -e {out}/gone.service.yml", timeout=${toString timeout})
         machine.succeed(f"test -e {out}/handwritten.yml")
   '';
 }

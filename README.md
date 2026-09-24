@@ -92,7 +92,14 @@ To release, simply run `make`, which will build static binaries for amd64 and ar
 Run `cargo nextest run --no-fail-fast` (or `make test`) to get the test report, and `make lint` to run clippy the same
 way the pre-commit hook does. CI runs both through Nix (`nix build .#x86_64_test .#x86_64_clippy`).
 
-To run an end to end test, run:
+There is an end-to-end test that runs the application against a real systemd in a NixOS VM:
+
+```bash
+nix build .#checks.x86_64-linux.e2e        # needs KVM
+nix build .#checks.x86_64-linux.e2e-no-kvm # the same test, emulated and slower; this is the one CI runs
+```
+
+To run an end to end test by hand on your own machine, run:
 
 ```bash
 while true; do sudo systemctl stop sleep.service; sleep 0.1; ! [ -f test/units/sleep.service.yml ] || break; sudo systemctl start sleep.service; sleep 0.1; [ -f test/units/sleep.service.yml ] || break; echo -n .; done

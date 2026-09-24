@@ -47,6 +47,9 @@ jobs:
       - name: Test and lint x86_64
         run: |
           nix build .#x86_64_test .#x86_64_clippy --print-build-logs
+      - name: End-to-end test (emulated, no KVM)
+        run: |
+          nix build .#checks.x86_64-linux.e2e-no-kvm --print-build-logs
       - name: Lint markdown
         run: |
           source <(nix print-dev-env . --verbose)
