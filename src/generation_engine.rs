@@ -215,6 +215,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_repeated_start_jobs_rewrite_changed_labels() {
+        // zbus only delivers the last ActiveState, so a quick restart is seen as active twice
+        let fs = Arc::new(MockFileSystem::new());
+        fs.add_file("/units/web.service", "[X-Traefik]\nLabel=traefik.a=1");
+        let mut unit = crate::dbus::MockSystemdUnit::new();
+        unit.expect_drop_in_paths().returning(|| Ok(vec![]));
+        unit.expect_fragment_path()
+            .returning(|| Ok("/units/web.service".to_string()));
+        let watched = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::from([
+            (
+                "web.service".to_string(),
+                UnitData::new_test("web.service", Box::new(unit)),
+            ),
+        ])));
+        let dbus = DBusContext::new_test_context(
+            Arc::new(crate::dbus::MockSystemdManager::new()),
+            fs.clone(),
+        );
+        let (tx, handle) =
+            process_service_change_messages(watched, dbus, fs.clone(), Path::new("/traefik"))
+                .await
+                .unwrap();
+        let started = || JobEvent {
+            unit_name: "web.service".to_string(),
+            started: true,
+        };
+
+        tx.send(started()).await.unwrap();
+        wait_for_file_content(&fs, "/traefik/web.service.yml", "a: 1\n").await;
+        fs.add_file("/units/web.service", "[X-Traefik]\nLabel=traefik.b=2");
+        tx.send(started()).await.unwrap();
+        wait_for_file_content(&fs, "/traefik/web.service.yml", "b: 2\n").await;
+
+        drop(tx);
+        handle.await.unwrap();
+    }
+
+    async fn wait_for_file_content(fs: &MockFileSystem, path: &str, expected: &str) {
+        let wait = async {
+            while fs.get_file_content(path).as_deref() != Some(expected) {
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::time::timeout(tokio::time::Duration::from_millis(500), wait)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{path} should contain {expected:?}, has {:?}",
+                    fs.get_file_content(path)
+                )
+            });
+    }
+
+    #[tokio::test]
     async fn test_stop_job_removes_yaml_of_untracked_unit() {
         let fs = Arc::new(MockFileSystem::new());
         fs.add_file("/traefik/gone.service.yml", "old");

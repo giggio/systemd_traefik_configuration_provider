@@ -27,6 +27,16 @@ pub struct UnitData {
     pub name: String,
 }
 
+#[cfg(test)]
+impl UnitData {
+    pub fn new_test(name: impl Into<String>, proxy: Box<dyn SystemdUnit>) -> Self {
+        Self {
+            proxy,
+            name: name.into(),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub struct JobEvent {
     pub unit_name: String,
