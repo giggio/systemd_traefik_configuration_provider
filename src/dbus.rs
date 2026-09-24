@@ -99,6 +99,70 @@ enum UnitSignal {
     Reloaded,
 }
 
+#[derive(Default)]
+struct PendingSignals {
+    reloaded: bool,
+    new_units: Vec<NewUnitArgs>,
+    new_unit_names: HashSet<String>,
+    closed: bool,
+}
+
+/// Hands the signals from the drain task to the watcher, coalesced so memory is bounded by the
+/// number of distinct units instead of the number of signals: a UnitNew for a name already
+/// pending is dropped, and a reload replaces everything pending, since the resync that follows
+/// lists every loaded unit anyway. Pushing never waits, which the drain task depends on.
+#[derive(Default)]
+struct SignalQueue {
+    pending: std::sync::Mutex<PendingSignals>,
+    notify: tokio::sync::Notify,
+}
+
+impl SignalQueue {
+    fn push(&self, signal: UnitSignal) {
+        {
+            let mut pending = self.pending.lock().unwrap();
+            match signal {
+                UnitSignal::New(args) => {
+                    if !pending.reloaded && pending.new_unit_names.insert(args.id.clone()) {
+                        pending.new_units.push(args);
+                    }
+                }
+                UnitSignal::Reloaded => {
+                    pending.reloaded = true;
+                    pending.new_units.clear();
+                    pending.new_unit_names.clear();
+                }
+            }
+        }
+        self.notify.notify_one();
+    }
+
+    fn close(&self) {
+        self.pending.lock().unwrap().closed = true;
+        self.notify.notify_one();
+    }
+
+    /// Waits for pending signals and takes them all, or returns `None` once the queue is closed
+    /// and empty.
+    async fn next_batch(&self) -> Option<PendingSignals> {
+        loop {
+            {
+                let mut pending = self.pending.lock().unwrap();
+                if pending.reloaded || !pending.new_units.is_empty() {
+                    let closed = pending.closed;
+                    let batch = std::mem::take(&mut *pending);
+                    pending.closed = closed;
+                    return Some(batch);
+                }
+                if pending.closed {
+                    return None;
+                }
+            }
+            self.notify.notified().await;
+        }
+    }
+}
+
 pub struct NewUnitArgs {
     id: String,
     unit: String,
@@ -168,7 +232,7 @@ impl DBusContext<'static> {
             .subscribe()
             .await
             .context("subscribing to systemd signals")?;
-        let (drain_handle, rx_unit_signals) = self.drain_unit_signals().await?;
+        let (drain_handle, signal_queue) = self.drain_unit_signals().await?;
         let units_lock = match self.list_units().await {
             Ok(units_lock) => units_lock,
             Err(e) => {
@@ -176,8 +240,7 @@ impl DBusContext<'static> {
                 return Err(e);
             }
         };
-        let (process_handle, rx_watch_events) =
-            self.watch_units(units_lock.clone(), rx_unit_signals);
+        let (process_handle, rx_watch_events) = self.watch_units(units_lock.clone(), signal_queue);
         Ok((
             units_lock,
             vec![drain_handle, process_handle],
@@ -188,13 +251,8 @@ impl DBusContext<'static> {
     /// zbus stops reading the socket (method replies included) while any signal stream's
     /// queue is full, so the signal streams must never wait on D-Bus calls made while
     /// inspecting a unit, or a burst of UnitNew (e.g. on daemon-reload) deadlocks the
-    /// connection. They are drained into an unbounded channel on their own task instead.
-    async fn drain_unit_signals(
-        &self,
-    ) -> Result<(
-        tokio::task::JoinHandle<()>,
-        tokio::sync::mpsc::UnboundedReceiver<UnitSignal>,
-    )> {
+    /// connection. They are drained into a queue that never waits, on their own task instead.
+    async fn drain_unit_signals(&self) -> Result<(tokio::task::JoinHandle<()>, Arc<SignalQueue>)> {
         let unit_new_stream = self
             .manager
             .receive_unit_new()
@@ -215,28 +273,24 @@ impl DBusContext<'static> {
                 })
             });
         let mut signals = futures::stream::select(unit_new_stream, reloaded_stream);
-        let (tx_unit_signals, rx_unit_signals) =
-            tokio::sync::mpsc::unbounded_channel::<UnitSignal>();
+        let signal_queue = Arc::new(SignalQueue::default());
+        let drain_queue = signal_queue.clone();
         let drain_handle = tokio::spawn(async move {
             while let Some(signal_res) = signals.next().await {
                 match signal_res {
-                    Ok(signal) => {
-                        if tx_unit_signals.send(signal).is_err() {
-                            trace!("Unit signals channel closed");
-                            return;
-                        }
-                    }
+                    Ok(signal) => drain_queue.push(signal),
                     Err(e) => error!("Error getting unit signal: {:#}", e),
                 }
             }
+            drain_queue.close();
         });
-        Ok((drain_handle, rx_unit_signals))
+        Ok((drain_handle, signal_queue))
     }
 
     fn watch_units(
         &self,
         units_lock: UnitList,
-        mut rx_unit_signals: tokio::sync::mpsc::UnboundedReceiver<UnitSignal>,
+        signal_queue: Arc<SignalQueue>,
     ) -> (
         tokio::task::JoinHandle<()>,
         tokio::sync::mpsc::Receiver<WatchEvent>,
@@ -245,19 +299,17 @@ impl DBusContext<'static> {
         let self_clone = self.clone();
         let process_handle = tokio::spawn(async move {
             let mut ignored = IgnoredUnits::new(MAX_IGNORED_UNITS);
-            while let Some(signal) = rx_unit_signals.recv().await {
-                match signal {
-                    UnitSignal::New(args) => {
-                        self_clone
-                            .track_new_unit(args, &units_lock, &mut ignored, &tx_watch_events)
-                            .await
-                    }
-                    UnitSignal::Reloaded => {
-                        info!("systemd reloaded, checking units again");
-                        self_clone
-                            .resync_units(&units_lock, &mut ignored, &tx_watch_events)
-                            .await
-                    }
+            while let Some(batch) = signal_queue.next_batch().await {
+                if batch.reloaded {
+                    info!("systemd reloaded, checking units again");
+                    self_clone
+                        .resync_units(&units_lock, &mut ignored, &tx_watch_events)
+                        .await;
+                }
+                for args in batch.new_units {
+                    self_clone
+                        .track_new_unit(args, &units_lock, &mut ignored, &tx_watch_events)
+                        .await;
                 }
             }
         });
@@ -772,6 +824,75 @@ mod tests {
         assert!(!ignored.contains("a.service"));
         assert!(!ignored.contains("b.service"));
         assert!(ignored.contains("c.service"));
+    }
+
+    fn new_unit(name: &str) -> UnitSignal {
+        UnitSignal::New(NewUnitArgs {
+            id: name.to_string(),
+            unit: format!("/obj/{name}"),
+        })
+    }
+
+    fn batch_names(batch: &PendingSignals) -> Vec<&str> {
+        batch
+            .new_units
+            .iter()
+            .map(|args| args.id.as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_signal_queue_drops_repeated_unit_new() {
+        let queue = SignalQueue::default();
+        for name in ["a.service", "b.service", "a.service"] {
+            queue.push(new_unit(name));
+        }
+
+        let batch = queue.next_batch().await.unwrap();
+
+        assert!(!batch.reloaded);
+        assert_eq!(batch_names(&batch), vec!["a.service", "b.service"]);
+    }
+
+    #[tokio::test]
+    async fn test_signal_queue_reload_replaces_pending_unit_new() {
+        let queue = SignalQueue::default();
+        queue.push(new_unit("a.service"));
+        queue.push(UnitSignal::Reloaded);
+        queue.push(new_unit("b.service"));
+
+        let batch = queue.next_batch().await.unwrap();
+
+        assert!(batch.reloaded);
+        assert!(batch.new_units.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_signal_queue_hands_over_pending_signals_before_closing() {
+        let queue = SignalQueue::default();
+        queue.push(new_unit("a.service"));
+        queue.close();
+
+        let batch = queue.next_batch().await.unwrap();
+        assert_eq!(batch_names(&batch), vec!["a.service"]);
+        assert!(queue.next_batch().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_signal_queue_wakes_the_consumer() {
+        let queue = Arc::new(SignalQueue::default());
+        let consumer_queue = queue.clone();
+        let consumer = tokio::spawn(async move { consumer_queue.next_batch().await });
+        tokio::task::yield_now().await;
+
+        queue.push(new_unit("a.service"));
+
+        let batch = tokio::time::timeout(tokio::time::Duration::from_millis(500), consumer)
+            .await
+            .expect("the consumer was not woken")
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch_names(&batch), vec!["a.service"]);
     }
 
     fn expect_subscriptions(mock_manager: &mut MockSystemdManager) {
@@ -1522,21 +1643,14 @@ mod tests {
         let mut mock_manager = MockSystemdManager::new();
         expect_subscriptions(&mut mock_manager);
         mock_manager.expect_list_units().returning(|| Ok(vec![]));
-        mock_manager.expect_receive_unit_new().return_once(|| {
-            let announcements = (0..2).map(|_| {
-                Ok(NewUnitArgs {
-                    id: "web.service".to_string(),
-                    unit: "/obj/web".to_string(),
-                })
-            });
-            Ok(
-                Box::pin(futures::stream::iter(announcements).chain(futures::stream::pending()))
-                    as UnitNewStream,
-            )
-        });
-        let get_unit_calls = AtomicUsize::new(0);
+        let (tx_unit_new, rx_unit_new) = futures::channel::mpsc::unbounded::<Result<NewUnitArgs>>();
+        mock_manager
+            .expect_receive_unit_new()
+            .return_once(move || Ok(Box::pin(rx_unit_new) as UnitNewStream));
+        let get_unit_calls = Arc::new(AtomicUsize::new(0));
+        let get_unit_calls_clone = get_unit_calls.clone();
         mock_manager.expect_get_unit().returning(move |_| {
-            if get_unit_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            if get_unit_calls_clone.fetch_add(1, Ordering::SeqCst) == 0 {
                 return Err(anyhow::anyhow!("transient failure"));
             }
             let mut u = MockSystemdUnit::new();
@@ -1545,12 +1659,30 @@ mod tests {
                 .returning(|| Ok("/units/web".to_string()));
             Ok(Box::new(u))
         });
+        let announce = || {
+            tx_unit_new
+                .unbounded_send(Ok(NewUnitArgs {
+                    id: "web.service".to_string(),
+                    unit: "/obj/web".to_string(),
+                }))
+                .unwrap()
+        };
         let mock_fs = Arc::new(MockFileSystem::new());
         mock_fs.add_file("/units/web", "[X-Traefik]\nLabel=web");
         let context = DBusContext::new_test_context(Arc::new(mock_manager), mock_fs);
 
         let (units_lock, handles, mut rx_watch_events) =
             context.load_and_watch_units().await.unwrap();
+        announce();
+        let wait_for_failure = async {
+            while get_unit_calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::time::timeout(tokio::time::Duration::from_millis(500), wait_for_failure)
+            .await
+            .expect("the unit was not inspected");
+        announce();
 
         let event = tokio::time::timeout(
             tokio::time::Duration::from_millis(500),
