@@ -23,8 +23,13 @@ pub async fn reconcile(
     fs: &dyn FileSystem,
     traefik_dir: &Path,
 ) -> Result<()> {
-    let read = watched_units.read().await;
-    for (unit_name, unit_data) in read.iter() {
+    let units = watched_units
+        .read()
+        .await
+        .iter()
+        .map(|(unit_name, unit_data)| (unit_name.clone(), unit_data.clone()))
+        .collect::<Vec<_>>();
+    for (unit_name, unit_data) in units {
         let started = match dbus.is_unit_running(unit_name.clone()).await {
             Ok(running) => running,
             Err(e) => {
@@ -38,7 +43,7 @@ pub async fn reconcile(
             if started { "" } else { "not " }
         );
         if let Err(e) =
-            handle_service_state_changed(dbus, started, unit_data, fs, traefik_dir).await
+            handle_service_state_changed(dbus, started, &unit_data, fs, traefik_dir).await
         {
             error!(
                 "Error handling reconciliation of unit {}: {:#}",
@@ -46,7 +51,13 @@ pub async fn reconcile(
             );
         }
     }
-    prune_orphan_yamls(read.keys(), fs, traefik_dir).context("pruning orphan unit yamls")
+    let tracked_units = watched_units
+        .read()
+        .await
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    prune_orphan_yamls(&tracked_units, fs, traefik_dir).context("pruning orphan unit yamls")
 }
 
 /// Removes generated files of units that are no longer tracked, e.g. removed or stripped of
@@ -97,15 +108,15 @@ pub async fn process_service_change_messages(
     let handle = tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
             let result = if job.started {
-                let units = watched.read().await;
-                let Some(unit_data) = units.get(&job.unit_name) else {
+                let unit_data = watched.read().await.get(&job.unit_name).cloned();
+                let Some(unit_data) = unit_data else {
                     debug!(
                         "Not generating yaml for unit {}, it is not tracked.",
                         job.unit_name
                     );
                     continue;
                 };
-                handle_service_state_changed(&dbus, true, unit_data, fs.as_ref(), &traefik_dir)
+                handle_service_state_changed(&dbus, true, &unit_data, fs.as_ref(), &traefik_dir)
                     .await
             } else {
                 // a unit dropped from tracking (e.g. lost its Traefik config) still needs its
@@ -258,6 +269,81 @@ mod tests {
         assert_eq!(fs.write_count(), 0);
     }
 
+    /// A unit whose D-Bus reads block until the test releases them.
+    struct GatedSystemdUnit {
+        tx_entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        rx_gate: tokio::sync::watch::Receiver<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::dbus::SystemdUnit for GatedSystemdUnit {
+        async fn drop_in_paths(&self) -> Result<Vec<String>> {
+            if let Some(tx_entered) = self.tx_entered.lock().unwrap().take() {
+                tx_entered.send(()).unwrap();
+            }
+            self.rx_gate.clone().wait_for(|is_open| *is_open).await?;
+            Ok(vec![])
+        }
+
+        async fn fragment_path(&self) -> Result<String> {
+            Ok(String::new())
+        }
+
+        async fn active_state(&self) -> Result<String> {
+            unimplemented!()
+        }
+
+        async fn receive_active_state_changed(
+            &self,
+        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_processing_a_job_does_not_hold_the_units_lock_during_dbus_calls() {
+        let (tx_entered, rx_entered) = tokio::sync::oneshot::channel();
+        let (tx_gate, rx_gate) = tokio::sync::watch::channel(false);
+        let unit = GatedSystemdUnit {
+            tx_entered: std::sync::Mutex::new(Some(tx_entered)),
+            rx_gate,
+        };
+        let watched = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::from([
+            (
+                "web.service".to_string(),
+                Arc::new(UnitData::new_test("web.service", Box::new(unit))),
+            ),
+        ])));
+        let fs = Arc::new(MockFileSystem::new());
+        let dbus = DBusContext::new_test_context(
+            Arc::new(crate::dbus::MockSystemdManager::new()),
+            fs.clone(),
+        );
+        let (tx, handle) =
+            process_service_change_messages(watched.clone(), dbus, fs, Path::new("/traefik"))
+                .await
+                .unwrap();
+
+        tx.send(JobEvent {
+            unit_name: "web.service".to_string(),
+            started: true,
+        })
+        .await
+        .unwrap();
+        rx_entered.await.unwrap();
+        let write_guard =
+            tokio::time::timeout(tokio::time::Duration::from_millis(100), watched.write()).await;
+        assert!(
+            write_guard.is_ok(),
+            "the units lock was held while waiting on D-Bus"
+        );
+        drop(write_guard);
+
+        tx_gate.send(true).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_repeated_start_jobs_rewrite_changed_labels() {
         // zbus only delivers the last ActiveState, so a quick restart is seen as active twice
@@ -270,7 +356,7 @@ mod tests {
         let watched = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::from([
             (
                 "web.service".to_string(),
-                UnitData::new_test("web.service", Box::new(unit)),
+                Arc::new(UnitData::new_test("web.service", Box::new(unit))),
             ),
         ])));
         let dbus = DBusContext::new_test_context(

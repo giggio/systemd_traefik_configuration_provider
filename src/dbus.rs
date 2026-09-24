@@ -21,7 +21,9 @@ pub struct DBusContext<'a> {
     fs: Arc<dyn FileSystem>,
 }
 
-pub type UnitList = Arc<RwLock<HashMap<String, UnitData>>>;
+/// Values are `Arc`s so a unit can be used after the lock is released, since every use
+/// involves D-Bus calls and holding the lock across them would block the unit watcher.
+pub type UnitList = Arc<RwLock<HashMap<String, Arc<UnitData>>>>;
 pub struct UnitData {
     proxy: Box<dyn SystemdUnit>,
     pub name: String,
@@ -245,7 +247,10 @@ impl DBusContext<'static> {
         match self.create_unit(name.clone(), args.unit).await {
             UnitCreation::Tracked(unit_data) => {
                 trace!("Adding unit {} to watched list", name);
-                units_lock.write().await.insert(name.clone(), unit_data);
+                units_lock
+                    .write()
+                    .await
+                    .insert(name.clone(), Arc::new(unit_data));
                 send_watch_event(tx_watch_events, WatchEvent::Watch(name)).await;
             }
             UnitCreation::Untracked => {
@@ -303,7 +308,10 @@ impl DBusContext<'static> {
                             continue;
                         }
                     };
-                    units_lock.write().await.insert(name.clone(), unit_data);
+                    units_lock
+                        .write()
+                        .await
+                        .insert(name.clone(), Arc::new(unit_data));
                     if !was_tracked {
                         info!("Unit {} now has Traefik config", name);
                         send_watch_event(tx_watch_events, WatchEvent::Watch(name.clone())).await;
@@ -448,7 +456,7 @@ impl<'a> DBusContext<'a> {
             if let UnitCreation::Tracked(unit_data) =
                 self.create_unit(name, object_path.to_string()).await
             {
-                units_map.insert(unit_data.name.clone(), unit_data);
+                units_map.insert(unit_data.name.clone(), Arc::new(unit_data));
             }
         }
         let unit_list = Arc::new(RwLock::new(units_map));
@@ -1222,7 +1230,10 @@ mod tests {
             DBusContext::new_test_context(Arc::new(mock_manager), Arc::new(MockFileSystem::new()));
         let units_lock = Arc::new(RwLock::new(HashMap::from([(
             "web.service".to_string(),
-            UnitData::new_test("web.service", Box::new(MockSystemdUnit::new())),
+            Arc::new(UnitData::new_test(
+                "web.service",
+                Box::new(MockSystemdUnit::new()),
+            )),
         )])));
         tx_watch_events
             .send(WatchEvent::Watch("web.service".to_string()))
