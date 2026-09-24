@@ -37,29 +37,15 @@ impl FileSystem for RealFileSystem {
     }
 
     fn exists(&self, path: &Path) -> bool {
-        if path.as_os_str().is_empty() {
-            return false;
-        }
-        if matches!(fs::exists(path), Ok(true)) {
-            if let Ok(metadata) = fs::metadata(path) {
-                return metadata.is_file();
-            }
-            return false;
-        }
-        false
+        fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
     }
 
     fn remove_file(&self, path: &Path) -> Result<()> {
-        if path.exists() {
-            match std::fs::remove_file(path) {
-                Ok(_) => Ok(()),
-                Err(e) => {
-                    error!("Failed to remove file: {:#}", e);
-                    Err(anyhow!("Failed to remove file: {:#}", e))
-                }
+        match fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(anyhow!("removing {}: {}", path.display(), e))
             }
-        } else {
-            Ok(())
+            _ => Ok(()),
         }
     }
 

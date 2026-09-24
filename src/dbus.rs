@@ -339,6 +339,8 @@ impl DBusContext<'static> {
         }
     }
 
+    /// Forwards unit state changes to the job processing until something it depends on stops,
+    /// which is always an error: shutting down is handled by the caller.
     pub async fn get_messages(
         &self,
         tx_new_job_event: tokio::sync::mpsc::Sender<JobEvent>,
@@ -357,11 +359,6 @@ impl DBusContext<'static> {
             .flatten();
         let mut changes_stream = futures::stream::select_all(streams_of_changes);
         let mut has_streams = !changes_stream.is_empty();
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut sigint =
-            signal(SignalKind::interrupt()).context("listening for SIGINT (Ctrl+C) signal")?;
-        let mut sigterm =
-            signal(SignalKind::terminate()).context("listening for SIGTERM signal")?;
         loop {
             tokio::select! {
                 event = rx_watch_events.recv() => {
@@ -371,7 +368,7 @@ impl DBusContext<'static> {
                                 trace!("Already following state of unit {}", unit_name);
                                 continue;
                             }
-                            info!("New unit being wached: {}", unit_name);
+                            info!("New unit being watched: {}", unit_name);
                             let new_unit_changes_stream = self.create_changes_stream(unit_name).await;
                             changes_stream.extend(new_unit_changes_stream);
                             has_streams = !changes_stream.is_empty();
@@ -380,21 +377,11 @@ impl DBusContext<'static> {
                         None => anyhow::bail!("the unit watcher stopped"),
                     }
                 }
-                property_changed_fut_opt = changes_stream.next(), if has_streams => {
-                    let Some(property_changed_fut) = property_changed_fut_opt else {
+                job = changes_stream.next(), if has_streams => {
+                    let Some(job) = job else {
                         anyhow::bail!("all unit state streams closed");
                     };
-                    if let Some(job) = property_changed_fut.await {
-                        send_job(&tx_new_job_event, job).await?;
-                    }
-                }
-                _ = sigint.recv() => {
-                    trace!("SIGINT (Ctrl+C) received, stopping...");
-                    return Ok(());
-                }
-                _ = sigterm.recv() => {
-                    trace!("SIGTERM received, stopping...");
-                    return Ok(());
+                    send_job(&tx_new_job_event, job).await?;
                 }
             };
         }
@@ -460,7 +447,7 @@ impl<'a> DBusContext<'a> {
             }
         }
         let unit_list = Arc::new(RwLock::new(units_map));
-        if log_enabled!(log::Level::Debug) {
+        if log_enabled!(log::Level::Trace) {
             let units = unit_list.read().await;
             let names = units.keys().cloned().collect::<Vec<_>>();
             trace!("Loaded {} units. Units: {names:?}", names.len());
@@ -491,7 +478,10 @@ impl<'a> DBusContext<'a> {
             Ok(true) => UnitCreation::Tracked(unit_data),
             Ok(false) => UnitCreation::Untracked,
             Err(e) => {
-                error!("Error getting unit: {:#}", e);
+                error!(
+                    "Error reading the configuration files of unit {name}: {:#}",
+                    e
+                );
                 UnitCreation::Failed
             }
         }
@@ -587,55 +577,48 @@ impl<'a> DBusContext<'a> {
     async fn create_changes_stream(
         &self,
         unit_name: String,
-    ) -> Option<Pin<Box<dyn Stream<Item = impl Future<Output = Option<JobEvent>>> + Send>>> {
+    ) -> Option<Pin<Box<dyn Stream<Item = JobEvent> + Send>>> {
         let obj_path = match self.manager.load_unit(unit_name.as_str()).await {
             Ok(obj_path) => obj_path,
             Err(e) => {
-                error!("Error loading unit: {:#}", e);
+                error!("Error loading unit {unit_name}: {:#}", e);
                 return None;
             }
         };
-        let unit_opt = match self.manager.get_unit(obj_path.to_string()).await {
-            Ok(unit) => Some(unit),
+        let unit = match self.manager.get_unit(obj_path).await {
+            Ok(unit) => unit,
             Err(e) => {
-                error!("Error getting unit: {:#}", e);
-                return None;
-            }
-        };
-        let unit = match unit_opt {
-            Some(unit) => unit,
-            None => {
-                error!("Error getting unit");
+                error!("Error getting unit {unit_name}: {:#}", e);
                 return None;
             }
         };
         let stream = match unit.receive_active_state_changed().await {
             Ok(s) => s,
             Err(e) => {
-                error!("Error getting active state changed stream: {:#}", e);
+                error!(
+                    "Error getting active state changed stream of {unit_name}: {:#}",
+                    e
+                );
                 return None;
             }
-        }
-        .map(move |property_changed| {
-            let unit_name_clone = unit_name.clone();
-            async move {
-                let state = match property_changed {
-                    Ok(x) => x,
-                    Err(e) => {
-                        error!("Error getting property changed: {:#}", e);
-                        return None;
-                    }
-                };
-                let job = JobEvent {
-                    unit_name: unit_name_clone,
-                    started: state == "active",
-                };
-                trace!("New job: {:?}", job);
-                Some(job)
-            }
-        })
-        .boxed();
-        Some(stream)
+        };
+        let jobs = stream.filter_map(move |state_res| {
+            std::future::ready(match state_res {
+                Ok(state) => {
+                    let job = JobEvent {
+                        unit_name: unit_name.clone(),
+                        started: state == "active",
+                    };
+                    trace!("New job: {:?}", job);
+                    Some(job)
+                }
+                Err(e) => {
+                    error!("Error getting property changed: {:#}", e);
+                    None
+                }
+            })
+        });
+        Some(jobs.boxed())
     }
 }
 

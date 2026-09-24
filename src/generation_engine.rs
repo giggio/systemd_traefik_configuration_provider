@@ -185,66 +185,52 @@ fn remove_unit_yaml(unit: &str, fs: &dyn FileSystem, traefik_dir: &Path) -> Resu
     if !fs.exists(&dest) {
         return Ok(());
     }
-    debug!("Removing unit yaml for {unit} from {}", dest.display());
-    if fs.exists(&dest) {
-        fs.remove_file(&dest)?;
-    }
+    fs.remove_file(&dest)?;
     info!("Removed {}", dest.display());
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
     use crate::infra::tests::MockFileSystem;
     use pretty_assertions::assert_eq;
-    use serial_test::serial;
-    use tempfile::TempDir;
+    use std::path::PathBuf;
 
     #[test]
-    #[serial]
     fn test_write_unit_yaml_creates_file() {
-        let temp_dir = TempDir::new().unwrap();
-        let canonical_temp_path = temp_dir.path().canonicalize().unwrap();
         let fs = MockFileSystem::new();
-        let result = write_unit_yaml("test.service", "foo".to_string(), &fs, &canonical_temp_path);
-        assert!(result.is_ok());
-        let yaml_path = canonical_temp_path.join("test.service.yml");
-        assert!(
-            fs.file_exists_in_memory(yaml_path.to_str().unwrap()),
-            "YAML path: {}",
-            yaml_path.display()
+        write_unit_yaml(
+            "test.service",
+            "foo".to_string(),
+            &fs,
+            Path::new("/traefik"),
+        )
+        .unwrap();
+        assert_eq!(
+            fs.get_file_content("/traefik/test.service.yml").unwrap(),
+            format!("{GENERATED_MARKER}foo")
         );
-        let content = fs.get_file_content(yaml_path.to_str().unwrap()).unwrap();
-        assert_eq!(content, format!("{GENERATED_MARKER}foo"));
     }
 
     #[test]
-    #[serial]
     fn test_write_unit_yaml_sanitizes_filename() {
-        let temp_dir = TempDir::new().unwrap();
-        let canonical_temp_path = temp_dir.path().canonicalize().unwrap();
         let fs = MockFileSystem::new();
-
         write_unit_yaml(
             "my@app!service.service",
             "foo".to_string(),
             &fs,
-            &canonical_temp_path,
+            Path::new("/traefik"),
         )
         .unwrap();
-
-        let yaml_path = canonical_temp_path.join("my_app_service.service.yml");
-        assert!(fs.file_exists_in_memory(yaml_path.to_str().unwrap()));
-
-        let content = fs.get_file_content(yaml_path.to_str().unwrap()).unwrap();
-        assert_eq!(content, format!("{GENERATED_MARKER}foo"));
+        assert_eq!(
+            fs.get_file_content("/traefik/my@app_service.service.yml")
+                .unwrap(),
+            format!("{GENERATED_MARKER}foo")
+        );
     }
 
     #[test]
-    #[serial]
     fn test_write_unit_yaml_replaces_changed_content() {
         let fs = MockFileSystem::new();
         let traefik_dir = PathBuf::from("/traefik");
@@ -257,7 +243,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_write_unit_yaml_does_not_rewrite_unchanged_content() {
         let fs = MockFileSystem::new();
         let traefik_dir = PathBuf::from("/traefik");
@@ -537,9 +522,9 @@ mod tests {
     #[test]
     fn test_prune_orphan_yamls_keeps_tracked_units() {
         let fs = MockFileSystem::new();
-        fs.add_file("/traefik/my_app.service.yml", GENERATED_MARKER);
+        fs.add_file("/traefik/my@app.service.yml", GENERATED_MARKER);
         prune_orphan_yamls([&"my@app.service".to_string()], &fs, Path::new("/traefik")).unwrap();
-        assert!(fs.file_exists_in_memory("/traefik/my_app.service.yml"));
+        assert!(fs.file_exists_in_memory("/traefik/my@app.service.yml"));
     }
 
     #[tokio::test]
@@ -572,53 +557,24 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_remove_unit_yaml_deletes_file() {
-        let temp_dir = TempDir::new().unwrap();
-        let temp_path = temp_dir.path().to_str().unwrap().to_string();
         let fs = MockFileSystem::new();
-        let yaml_path = temp_dir.path().join("test.service.yml");
-        fs.add_file(yaml_path.to_str().unwrap(), "dummy content".to_string());
-        assert!(
-            fs.file_exists_in_memory(yaml_path.to_str().unwrap()),
-            "File should exist before delete: {}",
-            yaml_path.display()
-        );
-
-        let result = remove_unit_yaml("test.service", &fs, &PathBuf::from(temp_path));
-        assert!(
-            result.is_ok(),
-            "remove_unit_yaml should succeed, error: {:?}",
-            result
-        );
-        assert!(
-            !fs.file_exists_in_memory(yaml_path.to_str().unwrap()),
-            "YAML file should be deleted at {}",
-            yaml_path.display()
-        );
+        fs.add_file("/traefik/test.service.yml", "dummy content");
+        remove_unit_yaml("test.service", &fs, Path::new("/traefik")).unwrap();
+        assert!(!fs.file_exists_in_memory("/traefik/test.service.yml"));
     }
 
     #[test]
-    #[serial]
     fn test_remove_unit_yaml_nonexistent_file() {
-        let temp_dir = TempDir::new().unwrap();
-        let canonical_temp_path = temp_dir.path().canonicalize().unwrap();
         let fs = MockFileSystem::new();
-        let result = remove_unit_yaml("nonexistent.service", &fs, &canonical_temp_path);
-        assert!(result.is_ok());
+        assert!(remove_unit_yaml("nonexistent.service", &fs, Path::new("/traefik")).is_ok());
     }
 
     #[test]
-    #[serial]
     fn test_remove_unit_yaml_sanitizes_filename() {
-        let temp_dir = TempDir::new().unwrap();
-        let canonical_temp_path = temp_dir.path().canonicalize().unwrap();
         let fs = MockFileSystem::new();
-        let yaml_path = canonical_temp_path.join("my_app_service.service.yml");
-        fs.add_file(yaml_path.to_str().unwrap(), "dummy content".to_string());
-        assert!(fs.file_exists_in_memory(yaml_path.to_str().unwrap()));
-        let result = remove_unit_yaml("my@app!service.service", &fs, &canonical_temp_path);
-        assert!(result.is_ok());
-        assert!(!fs.file_exists_in_memory(yaml_path.to_str().unwrap()));
+        fs.add_file("/traefik/my@app_service.service.yml", "dummy content");
+        remove_unit_yaml("my@app!service.service", &fs, Path::new("/traefik")).unwrap();
+        assert!(!fs.file_exists_in_memory("/traefik/my@app_service.service.yml"));
     }
 }

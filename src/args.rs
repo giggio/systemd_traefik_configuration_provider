@@ -13,7 +13,7 @@ pub struct Cli {
     #[arg(
         short,
         long,
-        value_name = "FILE",
+        value_name = "DIR",
         env = "TRAEFIK_OUT_DIR",
         default_value = "/etc/traefik/dynamic/units",
         global = true

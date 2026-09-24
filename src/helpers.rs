@@ -1,23 +1,23 @@
+/// `@` is kept so template instances (`app@a_b.service`) don't collide with other units
+/// (`app_a_b.service`).
 pub fn sanitize_filename(s: &str) -> String {
     let ascii = deunicode::deunicode_with_tofu(s, "_");
-
     let mut out = String::with_capacity(ascii.len());
-
     for ch in ascii.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' {
-            out.push(ch);
+        let ch = if ch.is_ascii_alphanumeric() || ".-_@".contains(ch) {
+            ch
         } else {
-            out.push('_');
+            '_'
+        };
+        if !(ch == '_' && (out.is_empty() || out.ends_with('_'))) {
+            out.push(ch);
         }
     }
-    let trimmed = regex::Regex::new(r"_+")
-        .unwrap()
-        .replace_all(out.trim_matches('_'), "_")
-        .to_string();
+    let trimmed = out.trim_end_matches('_');
     if trimmed.is_empty() {
         "untitled".to_string()
     } else {
-        trimmed
+        trimmed.to_string()
     }
 }
 
@@ -46,7 +46,16 @@ mod tests {
 
     #[test]
     fn test_sanitize_filename_with_special_chars() {
-        assert_eq!(sanitize_filename("my@app!service"), "my_app_service");
+        assert_eq!(sanitize_filename("my#app!service"), "my_app_service");
+    }
+
+    #[test]
+    fn test_sanitize_filename_keeps_template_instances_apart() {
+        assert_eq!(sanitize_filename("app@a_b.service"), "app@a_b.service");
+        assert_ne!(
+            sanitize_filename("app@a_b.service"),
+            sanitize_filename("app_a_b.service")
+        );
     }
 
     #[test]
@@ -59,7 +68,7 @@ mod tests {
 
     #[test]
     fn test_sanitize_filename_only_special_chars() {
-        assert_eq!(sanitize_filename("@#$%"), "untitled");
+        assert_eq!(sanitize_filename("#$%!"), "untitled");
     }
 
     #[test]
@@ -110,7 +119,7 @@ mod proptests {
             let result = sanitize_filename(&s);
             for c in result.chars() {
                 prop_assert!(
-                    c.is_ascii_alphanumeric() || ".-_".contains(c),
+                    c.is_ascii_alphanumeric() || ".-_@".contains(c),
                     "Output contains unsafe character: {}",
                     c
                 );
@@ -139,7 +148,7 @@ mod proptests {
         #[test]
         fn prop_sanitize_mixed_content(
             alphanumeric in "[a-zA-Z0-9]{1,5}",
-            special in "[@#$%!]"
+            special in "[#$%!]"
         ) {
             let input = format!("{}{}", alphanumeric, special);
             let result = sanitize_filename(&input);

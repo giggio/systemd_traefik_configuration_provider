@@ -9,9 +9,6 @@ mod logger;
 mod manager;
 // auto-generated with: zbus-xmlgen system org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/sleep_2eservice
 #[allow(clippy::all)]
-mod service;
-// auto-generated with: zbus-xmlgen system org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/sleep_2eservice
-#[allow(clippy::all)]
 mod unit;
 mod yaml;
 
@@ -69,6 +66,7 @@ async fn run(traefik_dir: std::path::PathBuf) -> Result<()> {
         .chain([process_msgs_join_handle])
         .collect();
     supervise(
+        shutdown_signal()?,
         dbus.get_messages(tx_new_job_event, watched, rx_watch_events),
         background_tasks,
     )
@@ -77,15 +75,39 @@ async fn run(traefik_dir: std::path::PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// Runs the main loop until it ends, failing if any background task ends first: they are all
-/// meant to live as long as the process, and one that stops means updates silently stop too.
-/// Failing lets systemd restart the service.
+/// Installs the SIGINT and SIGTERM handlers right away, and returns a future that completes on
+/// either of them.
+fn shutdown_signal() -> Result<impl Future<Output = ()>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigint =
+        signal(SignalKind::interrupt()).context("listening for SIGINT (Ctrl+C) signal")?;
+    let mut sigterm = signal(SignalKind::terminate()).context("listening for SIGTERM signal")?;
+    Ok(async move {
+        tokio::select! {
+            _ = sigint.recv() => trace!("SIGINT (Ctrl+C) received, stopping..."),
+            _ = sigterm.recv() => trace!("SIGTERM received, stopping..."),
+        }
+    })
+}
+
+/// Runs until shutdown is requested. The main loop and the background tasks are all meant to
+/// live as long as the process, so any of them ending first is an error: updates would silently
+/// stop otherwise. Failing lets systemd restart the service.
 async fn supervise(
+    shutdown: impl Future<Output = ()>,
     main_loop: impl Future<Output = Result<()>>,
     background_tasks: Vec<tokio::task::JoinHandle<()>>,
 ) -> Result<()> {
+    let main_loop = async {
+        main_loop.await?;
+        Err(anyhow!("the main loop stopped unexpectedly"))
+    };
     if background_tasks.is_empty() {
-        return main_loop.await;
+        return tokio::select! {
+            biased;
+            _ = shutdown => Ok(()),
+            result = main_loop => result,
+        };
     }
     let abort_handles = background_tasks
         .iter()
@@ -93,6 +115,7 @@ async fn supervise(
         .collect::<Vec<_>>();
     let result = tokio::select! {
         biased;
+        _ = shutdown => Ok(()),
         result = main_loop => result,
         (task_result, _, _) = futures::future::select_all(background_tasks) => match task_result {
             Ok(()) => Err(anyhow!("a background task stopped unexpectedly")),
@@ -124,9 +147,13 @@ mod tests {
     #[tokio::test]
     async fn test_supervise_fails_when_a_background_task_panics() {
         let panicking_task = tokio::spawn(async { panic!("boom") });
-        let error = supervise(std::future::pending(), vec![panicking_task])
-            .await
-            .unwrap_err();
+        let error = supervise(
+            std::future::pending(),
+            std::future::pending(),
+            vec![panicking_task],
+        )
+        .await
+        .unwrap_err();
         assert!(
             error.to_string().starts_with("a background task failed"),
             "{error}"
@@ -136,20 +163,40 @@ mod tests {
     #[tokio::test]
     async fn test_supervise_fails_when_a_background_task_returns() {
         let returning_task = tokio::spawn(async {});
-        let error = supervise(std::future::pending(), vec![returning_task])
-            .await
-            .unwrap_err();
+        let error = supervise(
+            std::future::pending(),
+            std::future::pending(),
+            vec![returning_task],
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.to_string(), "a background task stopped unexpectedly");
     }
 
     #[tokio::test]
-    async fn test_supervise_stops_background_tasks_when_main_loop_ends() {
+    async fn test_supervise_fails_when_the_main_loop_ends() {
+        let ended = supervise(std::future::pending(), async { Ok(()) }, vec![])
+            .await
+            .unwrap_err();
+        assert_eq!(ended.to_string(), "the main loop stopped unexpectedly");
+        let failed = supervise(
+            std::future::pending(),
+            async { Err(anyhow!("the unit watcher stopped")) },
+            vec![],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failed.to_string(), "the unit watcher stopped");
+    }
+
+    #[tokio::test]
+    async fn test_supervise_stops_background_tasks_on_shutdown() {
         let (tx_alive, rx_alive) = tokio::sync::oneshot::channel::<()>();
         let long_running_task = tokio::spawn(async move {
             let _tx_alive = tx_alive;
             std::future::pending::<()>().await
         });
-        supervise(async { Ok(()) }, vec![long_running_task])
+        supervise(async {}, std::future::pending(), vec![long_running_task])
             .await
             .unwrap();
         assert!(
