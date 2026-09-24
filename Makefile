@@ -1,4 +1,4 @@
-.PHONY: default build test clean run build_release release
+.PHONY: default build test clean run build_ci lint build_release release
 
 amd64_target := x86_64
 arm64_target := aarch64
@@ -20,10 +20,11 @@ run:
 	cargo run
 
 build_ci:
-	[ -f .forgejo/workflows/.secrets ] && source .forgejo/workflows/.secrets && forgejo-runner exec -W .forgejo/workflows/build.yaml --secret CACHIX_AUTH_TOKEN || echo "Secrets file missing at .forgejo/workflows/.secrets"
+	@if [ ! -f .forgejo/workflows/.secrets ]; then echo "Secrets file missing at .forgejo/workflows/.secrets"; exit 1; fi
+	. .forgejo/workflows/.secrets && forgejo-runner exec -W .forgejo/workflows/build.yaml --secret CACHIX_AUTH_TOKEN
 
 lint:
-	cargo clippy --all-targets -- -D warnings
+	cargo clippy --all-targets --all-features -- -D warnings
 
 build_release:
 	cargo build --release
