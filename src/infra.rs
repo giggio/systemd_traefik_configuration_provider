@@ -1,5 +1,8 @@
 use anyhow::{Result, anyhow};
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 pub trait FileSystem: Send + Sync {
     fn read_to_string(&self, path: &Path) -> Result<String>;
@@ -7,6 +10,7 @@ pub trait FileSystem: Send + Sync {
     fn exists(&self, path: &Path) -> bool;
     fn remove_file(&self, path: &Path) -> Result<()>;
     fn create_dir_all(&self, path: &Path) -> Result<()>;
+    fn list_files(&self, dir: &Path) -> Result<Vec<PathBuf>>;
 }
 
 pub struct RealFileSystem;
@@ -49,6 +53,17 @@ impl FileSystem for RealFileSystem {
 
     fn create_dir_all(&self, path: &Path) -> Result<()> {
         Ok(std::fs::create_dir_all(path)?)
+    }
+
+    fn list_files(&self, dir: &Path) -> Result<Vec<PathBuf>> {
+        let mut files = vec![];
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                files.push(entry.path());
+            }
+        }
+        Ok(files)
     }
 }
 
@@ -131,6 +146,15 @@ pub mod tests {
 
         fn create_dir_all(&self, _path: &Path) -> Result<()> {
             Ok(())
+        }
+
+        fn list_files(&self, dir: &Path) -> Result<Vec<PathBuf>> {
+            let files = self.files.lock().unwrap();
+            Ok(files
+                .keys()
+                .map(PathBuf::from)
+                .filter(|path| path.parent() == Some(dir))
+                .collect())
         }
     }
 }
