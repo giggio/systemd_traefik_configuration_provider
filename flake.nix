@@ -74,6 +74,13 @@
                 }/bin/systemd_traefik_configuration_provider $out/bin/systemd_traefik_configuration_provider_aarch64
               '';
         };
+        # needs KVM: nix build .#checks.x86_64-linux.e2e
+        checks = lib.optionalAttrs (system == "x86_64-linux") {
+          e2e = import ./e2e-test.nix {
+            inherit pkgs;
+            package = self.packages.${system}.x86_64;
+          };
+        };
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [
             (pkgs.fenix.complete.withComponents [
