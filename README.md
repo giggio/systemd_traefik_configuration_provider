@@ -89,15 +89,21 @@ To release, simply run `make`, which will build static binaries for amd64 and ar
 
 ## Testing
 
-Run `cargo nextest run --no-fail-fast` (or `make test`) to get the test report, and `make lint` to run clippy the same
-way the pre-commit hook does. CI runs both through Nix (`nix build .#x86_64_test .#x86_64_clippy`).
+Run `cargo nextest run --no-fail-fast` (or `make test`) to get the test report, `make lint` to run clippy the same way
+the pre-commit hook does, and `make lint_md` to lint the markdown.
+
+The make targets that need the tools from the dev shell (cargo, rumdl) enter it with `nix develop` when they don't run
+inside it already (through direnv or `nix develop`), so they work from any shell that has `nix` and `make`.
 
 There is an end-to-end test that runs the application against a real systemd in a NixOS VM:
 
 ```bash
-nix build .#checks.x86_64-linux.e2e        # needs KVM
-nix build .#checks.x86_64-linux.e2e-no-kvm # the same test, emulated and slower; this is the one CI runs
+make e2e        # needs KVM
+make e2e_no_kvm # the same test, emulated and slower
 ```
+
+CI runs `make check_nix` (the tests and clippy, built by Nix), `make e2e_no_kvm`, `make lint_md`, `make build_x86_64`
+and `make build_aarch64`, each as its own step.
 
 To run an end to end test by hand on your own machine, run:
 

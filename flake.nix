@@ -87,6 +87,8 @@
           };
         };
         devShells.default = pkgs.mkShell {
+          # the Makefile checks it to know it already runs inside this shell
+          TRAEFIK_PROVIDER_DEV_SHELL = "1";
           nativeBuildInputs = with pkgs; [
             (pkgs.fenix.complete.withComponents [
               "cargo"
