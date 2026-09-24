@@ -408,6 +408,110 @@ mod tests {
             });
     }
 
+    fn unit_with_fragment(fragment_path: &'static str) -> Arc<UnitData> {
+        let mut unit = crate::dbus::MockSystemdUnit::new();
+        unit.expect_drop_in_paths().returning(|| Ok(vec![]));
+        unit.expect_fragment_path()
+            .returning(move || Ok(fragment_path.to_string()));
+        let name = fragment_path.rsplit('/').next().unwrap();
+        Arc::new(UnitData::new_test(name, Box::new(unit)))
+    }
+
+    fn watched_units(units: impl IntoIterator<Item = Arc<UnitData>>) -> UnitList {
+        Arc::new(tokio::sync::RwLock::new(
+            units
+                .into_iter()
+                .map(|unit| (unit.name.clone(), unit))
+                .collect(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_writes_running_units_and_removes_stopped_ones() {
+        let fs = Arc::new(MockFileSystem::new());
+        fs.add_file("/units/running.service", "[X-Traefik]\nLabel=traefik.a=1");
+        fs.add_file("/units/stopped.service", "[X-Traefik]\nLabel=traefik.b=2");
+        fs.add_file("/units/unknown.service", "[X-Traefik]\nLabel=traefik.c=3");
+        fs.add_file("/traefik/stopped.service.yml", GENERATED_MARKER);
+        fs.add_file("/traefik/unknown.service.yml", GENERATED_MARKER);
+        let mut mock_manager = crate::dbus::MockSystemdManager::new();
+        mock_manager.expect_load_unit().returning(|name| {
+            if name == "unknown.service" {
+                Err(anyhow::anyhow!("no such unit"))
+            } else {
+                Ok(format!("/obj/{name}"))
+            }
+        });
+        mock_manager.expect_get_unit().returning(|object_path| {
+            let state = if object_path == "/obj/running.service" {
+                "active"
+            } else {
+                "inactive"
+            };
+            let mut u = crate::dbus::MockSystemdUnit::new();
+            u.expect_active_state()
+                .returning(move || Ok(state.to_string()));
+            Ok(Box::new(u))
+        });
+        let dbus = DBusContext::new_test_context(Arc::new(mock_manager), fs.clone());
+        let watched = watched_units([
+            unit_with_fragment("/units/running.service"),
+            unit_with_fragment("/units/stopped.service"),
+            unit_with_fragment("/units/unknown.service"),
+        ]);
+
+        reconcile(&dbus, &watched, fs.as_ref(), Path::new("/traefik"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs.get_file_content("/traefik/running.service.yml").unwrap(),
+            format!("{GENERATED_MARKER}a: 1\n")
+        );
+        assert!(!fs.file_exists_in_memory("/traefik/stopped.service.yml"));
+        assert!(
+            !fs.file_exists_in_memory("/traefik/unknown.service.yml"),
+            "a unit whose state can't be read is treated as stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_processing_skips_untracked_units_and_bad_labels_and_goes_on() {
+        let fs = Arc::new(MockFileSystem::new());
+        fs.add_file("/units/broken.service", "[X-Traefik]\nLabel=no_equals_sign");
+        fs.add_file("/units/web.service", "[X-Traefik]\nLabel=traefik.a=1");
+        let dbus = DBusContext::new_test_context(
+            Arc::new(crate::dbus::MockSystemdManager::new()),
+            fs.clone(),
+        );
+        let watched = watched_units([
+            unit_with_fragment("/units/broken.service"),
+            unit_with_fragment("/units/web.service"),
+        ]);
+        let (tx, handle) =
+            process_service_change_messages(watched, dbus, fs.clone(), Path::new("/traefik"))
+                .await
+                .unwrap();
+
+        for unit_name in ["untracked.service", "broken.service", "web.service"] {
+            tx.send(JobEvent {
+                unit_name: unit_name.to_string(),
+                started: true,
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        handle.await.unwrap();
+
+        assert!(!fs.file_exists_in_memory("/traefik/untracked.service.yml"));
+        assert!(!fs.file_exists_in_memory("/traefik/broken.service.yml"));
+        assert_eq!(
+            fs.get_file_content("/traefik/web.service.yml").unwrap(),
+            format!("{GENERATED_MARKER}a: 1\n")
+        );
+    }
+
     #[tokio::test]
     async fn test_reconcile_removes_only_generated_orphans() {
         let fs = Arc::new(MockFileSystem::new());

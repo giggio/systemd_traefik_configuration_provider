@@ -783,6 +783,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_is_unit_running_is_false_when_not_active() {
+        let mut mock_manager = MockSystemdManager::new();
+        mock_manager
+            .expect_load_unit()
+            .returning(|_| Ok("/obj/test".to_string()));
+        mock_manager.expect_get_unit().returning(|_| {
+            let mut u = MockSystemdUnit::new();
+            u.expect_active_state()
+                .returning(|| Ok("deactivating".to_string()));
+            Ok(Box::new(u))
+        });
+        let context =
+            DBusContext::new_test_context(Arc::new(mock_manager), Arc::new(MockFileSystem::new()));
+
+        let is_running = context
+            .is_unit_running("test.service".to_string())
+            .await
+            .unwrap();
+
+        assert!(!is_running);
+    }
+
+    #[tokio::test]
+    async fn test_create_changes_stream_is_none_when_the_unit_cannot_be_followed() {
+        let mut failing_load = MockSystemdManager::new();
+        failing_load
+            .expect_load_unit()
+            .returning(|_| Err(anyhow::anyhow!("no such unit")));
+
+        let mut failing_get = MockSystemdManager::new();
+        failing_get
+            .expect_load_unit()
+            .returning(|_| Ok("/obj/test".to_string()));
+        failing_get
+            .expect_get_unit()
+            .returning(|_| Err(anyhow::anyhow!("no such object")));
+
+        let mut failing_stream = MockSystemdManager::new();
+        failing_stream
+            .expect_load_unit()
+            .returning(|_| Ok("/obj/test".to_string()));
+        failing_stream.expect_get_unit().returning(|_| {
+            let mut u = MockSystemdUnit::new();
+            u.expect_receive_active_state_changed()
+                .returning(|| Err(anyhow::anyhow!("no match rule")));
+            Ok(Box::new(u))
+        });
+
+        for mock_manager in [failing_load, failing_get, failing_stream] {
+            let context = DBusContext::new_test_context(
+                Arc::new(mock_manager),
+                Arc::new(MockFileSystem::new()),
+            );
+            assert!(
+                context
+                    .create_changes_stream("test.service".to_string())
+                    .await
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_load_and_watch_units_fails_when_subscribe_fails() {
+        let mut mock_manager = MockSystemdManager::new();
+        mock_manager
+            .expect_subscribe()
+            .returning(|| Err(anyhow::anyhow!("access denied")));
+        let context =
+            DBusContext::new_test_context(Arc::new(mock_manager), Arc::new(MockFileSystem::new()));
+
+        let error = context.load_and_watch_units().await.err().unwrap();
+
+        assert_eq!(error.to_string(), "subscribing to systemd signals");
+    }
+
+    #[tokio::test]
+    async fn test_load_and_watch_units_fails_when_listing_fails() {
+        let mut mock_manager = MockSystemdManager::new();
+        expect_subscriptions(&mut mock_manager);
+        mock_manager
+            .expect_receive_unit_new()
+            .return_once(|| Ok(Box::pin(futures::stream::pending()) as UnitNewStream));
+        mock_manager
+            .expect_list_units()
+            .returning(|| Err(anyhow::anyhow!("bus closed")));
+        let context =
+            DBusContext::new_test_context(Arc::new(mock_manager), Arc::new(MockFileSystem::new()));
+
+        let error = context.load_and_watch_units().await.err().unwrap();
+
+        assert_eq!(error.to_string(), "bus closed");
+    }
+
+    #[tokio::test]
     async fn test_list_units() {
         let mut mock_manager = MockSystemdManager::new();
         let mock_fs = Arc::new(MockFileSystem::new());
@@ -1383,6 +1478,108 @@ mod tests {
         tracked.sort();
         assert_eq!(tracked, vec!["gaining.service", "keeping.service"]);
 
+        for h in handles {
+            h.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_watch_units_retries_unit_whose_inspection_failed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut mock_manager = MockSystemdManager::new();
+        expect_subscriptions(&mut mock_manager);
+        mock_manager.expect_list_units().returning(|| Ok(vec![]));
+        mock_manager.expect_receive_unit_new().return_once(|| {
+            let announcements = (0..2).map(|_| {
+                Ok(NewUnitArgs {
+                    id: "web.service".to_string(),
+                    unit: "/obj/web".to_string(),
+                })
+            });
+            Ok(
+                Box::pin(futures::stream::iter(announcements).chain(futures::stream::pending()))
+                    as UnitNewStream,
+            )
+        });
+        let get_unit_calls = AtomicUsize::new(0);
+        mock_manager.expect_get_unit().returning(move |_| {
+            if get_unit_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(anyhow::anyhow!("transient failure"));
+            }
+            let mut u = MockSystemdUnit::new();
+            u.expect_drop_in_paths().returning(|| Ok(vec![]));
+            u.expect_fragment_path()
+                .returning(|| Ok("/units/web".to_string()));
+            Ok(Box::new(u))
+        });
+        let mock_fs = Arc::new(MockFileSystem::new());
+        mock_fs.add_file("/units/web", "[X-Traefik]\nLabel=web");
+        let context = DBusContext::new_test_context(Arc::new(mock_manager), mock_fs);
+
+        let (units_lock, handles, mut rx_watch_events) =
+            context.load_and_watch_units().await.unwrap();
+
+        let event = tokio::time::timeout(
+            tokio::time::Duration::from_millis(500),
+            rx_watch_events.recv(),
+        )
+        .await
+        .expect("a failed inspection must not stop the unit from being tracked later")
+        .unwrap();
+        assert_eq!(event, WatchEvent::Watch("web.service".to_string()));
+        assert!(units_lock.read().await.contains_key("web.service"));
+        for h in handles {
+            h.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reload_changes_nothing_when_listing_fails() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut mock_manager = MockSystemdManager::new();
+        mock_manager.expect_subscribe().return_once(|| Ok(()));
+        let (tx_reloading, rx_reloading) = futures::channel::mpsc::unbounded::<Result<bool>>();
+        mock_manager
+            .expect_receive_reloading()
+            .return_once(move || Ok(Box::pin(rx_reloading)));
+        mock_manager
+            .expect_receive_unit_new()
+            .return_once(|| Ok(Box::pin(futures::stream::pending()) as UnitNewStream));
+        let list_units_calls = Arc::new(AtomicUsize::new(0));
+        let list_units_calls_clone = list_units_calls.clone();
+        mock_manager.expect_list_units().returning(move || {
+            if list_units_calls_clone.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(vec![list_units_row("web.service", "/obj/web")])
+            } else {
+                Err(anyhow::anyhow!("bus closed"))
+            }
+        });
+        mock_manager.expect_get_unit().returning(|_| {
+            let mut u = MockSystemdUnit::new();
+            u.expect_drop_in_paths().returning(|| Ok(vec![]));
+            u.expect_fragment_path()
+                .returning(|| Ok("/units/web".to_string()));
+            Ok(Box::new(u))
+        });
+        let mock_fs = Arc::new(MockFileSystem::new());
+        mock_fs.add_file("/units/web", "[X-Traefik]\nLabel=web");
+        let context = DBusContext::new_test_context(Arc::new(mock_manager), mock_fs);
+        let (units_lock, handles, mut rx_watch_events) =
+            context.load_and_watch_units().await.unwrap();
+
+        tx_reloading.unbounded_send(Ok(false)).unwrap();
+        let wait_for_reload = async {
+            while list_units_calls.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::time::timeout(tokio::time::Duration::from_millis(500), wait_for_reload)
+            .await
+            .expect("the reload was not handled");
+        tokio::task::yield_now().await;
+
+        assert!(rx_watch_events.try_recv().is_err());
+        assert!(units_lock.read().await.contains_key("web.service"));
         for h in handles {
             h.abort();
         }

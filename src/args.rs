@@ -49,4 +49,14 @@ mod tests {
         let cli = Cli::parse_from(args);
         assert_eq!(cli.traefik_out_dir, PathBuf::from("/tmp/traefik"));
     }
+
+    #[test]
+    fn test_cli_with_log_hide_date() {
+        assert!(!Cli::parse_from(BASIC_ARGS).log_hide_date);
+        let args = Vec::from(BASIC_ARGS)
+            .into_iter()
+            .chain(["--log-hide-date"])
+            .collect::<Vec<_>>();
+        assert!(Cli::parse_from(args).log_hide_date);
+    }
 }

@@ -263,6 +263,12 @@ a:
     }
 
     #[test]
+    fn assignment_without_equals_sign_is_an_error() {
+        let result = build_traefik_file_yaml(vec!["traefik.http.routers.r1.rule"]);
+        assert_eq!(result.unwrap_err().to_string(), "missing '=' in assignment");
+    }
+
+    #[test]
     fn index_too_large_is_an_error() {
         let result = build_traefik_file_yaml(vec![r#"a.items[99999999999] = "x""#]);
         assert!(result.is_err());

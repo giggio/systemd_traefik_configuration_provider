@@ -148,6 +148,39 @@ pub mod tests {
         assert_eq!(files, vec!["web.service.yml"]);
     }
 
+    #[test]
+    fn test_real_exists_is_true_only_for_files() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("web.service.yml");
+        std::fs::write(&file_path, "").unwrap();
+
+        assert!(RealFileSystem.exists(&file_path));
+        assert!(!RealFileSystem.exists(temp_dir.path()));
+        assert!(!RealFileSystem.exists(&temp_dir.path().join("missing.yml")));
+        assert!(!RealFileSystem.exists(Path::new("")));
+    }
+
+    #[test]
+    fn test_real_list_files_skips_directories() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(temp_dir.path().join("web.service.yml"), "").unwrap();
+        std::fs::create_dir(temp_dir.path().join("subdir")).unwrap();
+
+        let files = RealFileSystem.list_files(temp_dir.path()).unwrap();
+
+        assert_eq!(files, vec![temp_dir.path().join("web.service.yml")]);
+    }
+
+    #[test]
+    fn test_real_remove_file_of_missing_file_is_ok() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        assert!(
+            RealFileSystem
+                .remove_file(&temp_dir.path().join("missing.yml"))
+                .is_ok()
+        );
+    }
+
     impl FileSystem for MockFileSystem {
         fn read_to_string(&self, path: &Path) -> Result<String> {
             let files = self.files.lock().unwrap();
