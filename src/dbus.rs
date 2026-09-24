@@ -1201,6 +1201,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_messages_does_not_follow_again_a_unit_already_in_the_map() {
+        // the watcher can insert a unit and send its Watch before get_messages takes its
+        // snapshot of the map, so the unit shows up in both
+        let (tx_job, _rx_job) = tokio::sync::mpsc::channel(10);
+        let (tx_watch_events, rx_watch_events) = tokio::sync::mpsc::channel(10);
+        let mut mock_manager = MockSystemdManager::new();
+        mock_manager
+            .expect_load_unit()
+            .returning(|_| Ok("/obj/web".to_string()));
+        mock_manager.expect_get_unit().times(1).returning(|_| {
+            let mut u = MockSystemdUnit::new();
+            u.expect_receive_active_state_changed().return_once(|| {
+                Ok(Box::pin(futures::stream::pending())
+                    as Pin<Box<dyn Stream<Item = Result<String>> + Send>>)
+            });
+            Ok(Box::new(u))
+        });
+        let context =
+            DBusContext::new_test_context(Arc::new(mock_manager), Arc::new(MockFileSystem::new()));
+        let units_lock = Arc::new(RwLock::new(HashMap::from([(
+            "web.service".to_string(),
+            UnitData::new_test("web.service", Box::new(MockSystemdUnit::new())),
+        )])));
+        tx_watch_events
+            .send(WatchEvent::Watch("web.service".to_string()))
+            .await
+            .unwrap();
+        drop(tx_watch_events);
+
+        let error = context
+            .get_messages(tx_job, units_lock, rx_watch_events)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "the unit watcher stopped");
+    }
+
+    #[tokio::test]
     async fn test_get_messages_fails_when_job_processing_stopped() {
         let (tx_job, rx_job) = tokio::sync::mpsc::channel(10);
         drop(rx_job);
