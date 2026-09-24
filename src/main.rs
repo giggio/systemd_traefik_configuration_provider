@@ -4,11 +4,7 @@ mod generation_engine;
 mod helpers;
 mod infra;
 mod logger;
-// auto-generated with: zbus-xmlgen system org.freedesktop.systemd1 /org/freedesktop/systemd1
-#[allow(clippy::all)]
 mod manager;
-// auto-generated with: zbus-xmlgen system org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/sleep_2eservice
-#[allow(clippy::all)]
 mod unit;
 mod yaml;
 
