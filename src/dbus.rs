@@ -99,29 +99,42 @@ impl DBusContext<'static> {
         tokio::sync::mpsc::Receiver<NewUnit>,
     ) {
         let (tx_new_unit, rx_new_unit) = tokio::sync::mpsc::channel::<NewUnit>(100);
-        let units_lock_new_clone = units_lock.clone();
-        let self_new_clone = self.clone();
-        let h1 = tokio::spawn(async move {
-            let mut unit_new_stream = match self_new_clone.manager.receive_unit_new().await {
+        // zbus stops reading the socket (method replies included) while any signal stream's
+        // queue is full, so the UnitNew stream must never wait on D-Bus calls made while
+        // inspecting a unit, or a burst of UnitNew (e.g. on daemon-reload) deadlocks the
+        // connection. It is drained into an unbounded channel on its own task instead.
+        let (tx_unit_new_args, mut rx_unit_new_args) =
+            tokio::sync::mpsc::unbounded_channel::<NewUnitArgs>();
+        let manager = self.manager.clone();
+        let drain_handle = tokio::spawn(async move {
+            let mut unit_new_stream = match manager.receive_unit_new().await {
                 Ok(s) => s,
                 Err(e) => {
                     error!("Error receiving unit new stream: {:#}", e);
                     return;
                 }
             };
+            while let Some(unit_res) = unit_new_stream.next().await {
+                match unit_res {
+                    Ok(args) => {
+                        if tx_unit_new_args.send(args).is_err() {
+                            trace!("Unit new args channel closed");
+                            return;
+                        }
+                    }
+                    Err(e) => error!("Error getting unit args: {:#}", e),
+                }
+            }
+        });
+        let units_lock_new_clone = units_lock.clone();
+        let self_new_clone = self.clone();
+        let process_handle = tokio::spawn(async move {
             // Names already inspected and found to carry no Traefik config. systemd emits a
             // fresh UnitNew every time a not-found unit is re-materialized, and inspecting it
             // re-materializes it, so without this cache a single ghost reference would make the
             // daemon probe it forever in a tight loop.
             let mut ignored: HashSet<String> = HashSet::new();
-            while let Some(unit_res) = unit_new_stream.next().await {
-                let args = match unit_res {
-                    Ok(args) => args,
-                    Err(e) => {
-                        error!("Error getting unit args: {:#}", e);
-                        continue;
-                    }
-                };
+            while let Some(args) = rx_unit_new_args.recv().await {
                 let name = args.id.clone();
                 if ignored.contains(&name) {
                     continue;
@@ -161,7 +174,7 @@ impl DBusContext<'static> {
                 }
             }
         });
-        (vec![h1], rx_new_unit)
+        (vec![drain_handle, process_handle], rx_new_unit)
     }
 
     pub async fn get_messages(
@@ -761,6 +774,105 @@ mod tests {
         );
         let units = units_lock.read().await;
         assert!(!units.contains_key("ghost.service"));
+    }
+
+    type UnitNewStream = Pin<Box<dyn Stream<Item = Result<NewUnitArgs>> + Send>>;
+
+    /// Mimics zbus: signals go through a small bounded queue and the socket reader only gets to
+    /// a method reply after it managed to enqueue every signal that arrived before it.
+    struct QueueLimitedSystemdManager {
+        unit_new_stream: std::sync::Mutex<Option<UnitNewStream>>,
+        rx_replies_ready: tokio::sync::watch::Receiver<bool>,
+    }
+
+    #[async_trait]
+    impl SystemdManager for QueueLimitedSystemdManager {
+        #[allow(clippy::type_complexity)]
+        async fn list_units(
+            &self,
+        ) -> Result<
+            Vec<(
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                zbus::zvariant::OwnedObjectPath,
+                u32,
+                String,
+                zbus::zvariant::OwnedObjectPath,
+            )>,
+        > {
+            unimplemented!()
+        }
+
+        async fn receive_unit_new(&self) -> Result<UnitNewStream> {
+            Ok(self.unit_new_stream.lock().unwrap().take().unwrap())
+        }
+
+        async fn load_unit(&self, _name: &str) -> Result<String> {
+            unimplemented!()
+        }
+
+        async fn get_unit(&self, path: String) -> Result<Box<dyn SystemdUnit>> {
+            self.rx_replies_ready
+                .clone()
+                .wait_for(|ready| *ready)
+                .await?;
+            let mut u = MockSystemdUnit::new();
+            u.expect_drop_in_paths().returning(|| Ok(vec![]));
+            u.expect_fragment_path().returning(move || Ok(path.clone()));
+            Ok(Box::new(u))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_watch_units_keeps_draining_unit_new_while_inspecting_unit() {
+        const QUEUE_CAPACITY: usize = 2;
+        let (mut tx_signal, rx_signal) =
+            futures::channel::mpsc::channel::<Result<NewUnitArgs>>(QUEUE_CAPACITY);
+        let (tx_replies_ready, rx_replies_ready) = tokio::sync::watch::channel(false);
+        let manager = QueueLimitedSystemdManager {
+            unit_new_stream: std::sync::Mutex::new(Some(Box::pin(rx_signal))),
+            rx_replies_ready,
+        };
+        let mock_fs = Arc::new(MockFileSystem::new());
+        mock_fs.add_file("/web.service", "[X-Traefik]\nLabel=web");
+        let context = DBusContext::new_test_context(Arc::new(manager), mock_fs);
+        let units_lock = Arc::new(RwLock::new(HashMap::new()));
+        let (handles, mut rx_new_unit) = context.watch_units(units_lock.clone()).await;
+
+        // A burst of UnitNew signals, larger than the queue, like systemd emits on daemon-reload.
+        let socket_reader = tokio::spawn(async move {
+            use futures::SinkExt;
+            let names = std::iter::once("web.service".to_string())
+                .chain((0..QUEUE_CAPACITY * 4).map(|i| format!("other{i}.service")));
+            for name in names {
+                let args = NewUnitArgs {
+                    unit: format!("/{name}"),
+                    id: name,
+                };
+                tx_signal.send(Ok(args)).await.unwrap();
+            }
+            tx_replies_ready.send(true).unwrap();
+            tx_signal
+        });
+
+        let event = tokio::time::timeout(
+            tokio::time::Duration::from_millis(500),
+            rx_new_unit.recv(),
+        )
+        .await
+        .expect("deadlock: unit inspection waited on a reply stuck behind the full UnitNew queue")
+        .expect("Channel closed before receiving event");
+        assert_eq!(event.unit, "web.service");
+        assert!(units_lock.read().await.contains_key("web.service"));
+
+        socket_reader.abort();
+        for h in handles {
+            h.abort();
+        }
     }
 
     #[tokio::test]
