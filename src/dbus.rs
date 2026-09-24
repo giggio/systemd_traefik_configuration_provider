@@ -58,6 +58,9 @@ pub enum WatchEvent {
 /// ignored names would only grow between reloads without a cap.
 const MAX_IGNORED_UNITS: usize = 10_000;
 
+/// How many units are inspected at the same time after a daemon-reload.
+const RESYNC_CONCURRENCY: usize = 8;
+
 /// Names already inspected and found to carry no Traefik config. systemd emits a fresh UnitNew
 /// every time a not-found unit is re-materialized, and inspecting it re-materializes it, so
 /// without this cache a single ghost reference would make the daemon probe it forever in a tight
@@ -385,16 +388,37 @@ impl DBusContext<'static> {
                 Err(e) => error!("Error loading unit {name} after reload: {:#}", e),
             }
         }
-        for (name, object_path) in candidates {
-            let was_tracked = units_lock.read().await.contains_key(&name);
-            match self.create_unit(name.clone(), object_path).await {
+        let tracked_before = units_lock
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let inspections = futures::stream::iter(candidates)
+            .map(|(name, object_path)| async move {
+                let creation = self.create_unit(name.clone(), object_path).await;
+                let started = match &creation {
+                    UnitCreation::Tracked(unit_data) => {
+                        Some(unit_data.proxy.active_state().await.map(|s| s == "active"))
+                    }
+                    _ => None,
+                };
+                (name, creation, started)
+            })
+            .buffer_unordered(RESYNC_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        for (name, creation, started) in inspections {
+            let was_tracked = tracked_before.contains(&name);
+            match creation {
                 UnitCreation::Tracked(unit_data) => {
-                    let started = match unit_data.proxy.active_state().await {
-                        Ok(state) => state == "active",
-                        Err(e) => {
+                    let started = match started {
+                        Some(Ok(started)) => started,
+                        Some(Err(e)) => {
                             error!("Error getting state of unit {name} after reload: {:#}", e);
                             continue;
                         }
+                        None => unreachable!("the state is read for every tracked unit"),
                     };
                     units_lock
                         .write()
@@ -1693,6 +1717,109 @@ mod tests {
         .unwrap();
         assert_eq!(event, WatchEvent::Watch("web.service".to_string()));
         assert!(units_lock.read().await.contains_key("web.service"));
+        for h in handles {
+            h.abort();
+        }
+    }
+
+    type ReloadingStream = Pin<Box<dyn Stream<Item = Result<bool>> + Send>>;
+
+    /// Once armed, `get_unit` only returns when two calls are waiting at the same time.
+    struct BarrierSystemdManager {
+        armed: std::sync::atomic::AtomicBool,
+        barrier: tokio::sync::Barrier,
+        reloading: std::sync::Mutex<Option<ReloadingStream>>,
+    }
+
+    #[async_trait]
+    impl SystemdManager for BarrierSystemdManager {
+        #[allow(clippy::type_complexity)]
+        async fn list_units(
+            &self,
+        ) -> Result<
+            Vec<(
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                zbus::zvariant::OwnedObjectPath,
+                u32,
+                String,
+                zbus::zvariant::OwnedObjectPath,
+            )>,
+        > {
+            Ok(vec![
+                list_units_row("a.service", "/obj/a"),
+                list_units_row("b.service", "/obj/b"),
+            ])
+        }
+
+        async fn subscribe(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn receive_unit_new(&self) -> Result<UnitNewStream> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        async fn receive_reloading(
+            &self,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<bool>> + Send>>> {
+            Ok(self.reloading.lock().unwrap().take().unwrap())
+        }
+
+        async fn load_unit(&self, _name: &str) -> Result<String> {
+            unimplemented!()
+        }
+
+        async fn get_unit(&self, _path: String) -> Result<Box<dyn SystemdUnit>> {
+            if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+                self.barrier.wait().await;
+            }
+            let mut u = MockSystemdUnit::new();
+            u.expect_drop_in_paths().returning(|| Ok(vec![]));
+            u.expect_fragment_path()
+                .returning(|| Ok("/units/web".to_string()));
+            u.expect_active_state()
+                .returning(|| Ok("active".to_string()));
+            Ok(Box::new(u))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reload_inspects_units_concurrently() {
+        let (tx_reloading, rx_reloading) = futures::channel::mpsc::unbounded::<Result<bool>>();
+        let manager = Arc::new(BarrierSystemdManager {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            barrier: tokio::sync::Barrier::new(2),
+            reloading: std::sync::Mutex::new(Some(Box::pin(rx_reloading))),
+        });
+        let mock_fs = Arc::new(MockFileSystem::new());
+        mock_fs.add_file("/units/web", "[X-Traefik]\nLabel=web");
+        let context = DBusContext::new_test_context(manager.clone(), mock_fs);
+        let (_units_lock, handles, mut rx_watch_events) =
+            context.load_and_watch_units().await.unwrap();
+
+        manager
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tx_reloading.unbounded_send(Ok(false)).unwrap();
+
+        for _ in 0..2 {
+            let event = tokio::time::timeout(
+                tokio::time::Duration::from_millis(500),
+                rx_watch_events.recv(),
+            )
+            .await
+            .expect("the units were inspected one at a time")
+            .unwrap();
+            assert!(matches!(
+                event,
+                WatchEvent::Job(JobEvent { started: true, .. })
+            ));
+        }
         for h in handles {
             h.abort();
         }
