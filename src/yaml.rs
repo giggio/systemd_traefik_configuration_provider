@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use serde_yaml::{Mapping, Value};
 
 pub fn build_traefik_file_yaml(lines: Vec<impl Into<String>>) -> Result<String> {
@@ -29,21 +29,24 @@ enum PathItem {
     KeyIndex(String, usize),
 }
 
-fn parse_path(s: &str) -> Vec<PathItem> {
+/// Guards against a label like `servers[99999999999]` filling memory with nulls.
+const MAX_INDEX: usize = 1024;
+
+fn parse_path(s: &str) -> Result<Vec<PathItem>> {
     s.split('.')
-        .map(|part| {
-            if let Some(open) = part.find('[') {
-                if part.ends_with(']') {
-                    let name = &part[..open];
-                    let idx_str = &part[open + 1..part.len() - 1];
-                    let idx = idx_str.parse::<usize>().unwrap_or(0);
-                    PathItem::KeyIndex(name.to_string(), idx)
-                } else {
-                    PathItem::Key(part.to_string())
+        .map(|part| match part.find('[') {
+            Some(open) if part.ends_with(']') => {
+                let name = &part[..open];
+                let idx_str = &part[open + 1..part.len() - 1];
+                let idx = idx_str
+                    .parse::<usize>()
+                    .map_err(|_| anyhow!("invalid index '{idx_str}' in '{s}'"))?;
+                if idx >= MAX_INDEX {
+                    bail!("index {idx} in '{s}' is too large, the limit is {MAX_INDEX}");
                 }
-            } else {
-                PathItem::Key(part.to_string())
+                Ok(PathItem::KeyIndex(name.to_string(), idx))
             }
+            _ => Ok(PathItem::Key(part.to_string())),
         })
         .collect()
 }
@@ -73,7 +76,7 @@ fn parse_assignment(line: String) -> Result<(Vec<PathItem>, Value)> {
         }
     };
 
-    Ok((parse_path(key), value))
+    Ok((parse_path(key)?, value))
 }
 
 fn ensure_mapping(v: &mut Value) -> &mut Mapping {
@@ -85,14 +88,16 @@ fn ensure_mapping(v: &mut Value) -> &mut Mapping {
 
 fn ensure_sequence_for_key<'a>(mapping: &'a mut Mapping, key: &'a str) -> &'a mut Vec<Value> {
     let k = Value::String(key.to_string());
-    if !mapping.contains_key(&k) {
-        mapping.insert(k.clone(), Value::Sequence(Vec::new()));
+    let value = mapping
+        .entry(k)
+        .or_insert_with(|| Value::Sequence(Vec::new()));
+    if !value.is_sequence() {
+        *value = Value::Sequence(Vec::new());
     }
-    mapping
-        .get_mut(&k)
-        .unwrap()
-        .as_sequence_mut()
-        .expect("value is not a sequence")
+    match value {
+        Value::Sequence(seq) => seq,
+        _ => unreachable!("value was just made a sequence"),
+    }
 }
 
 fn ensure_mapping_for_key<'a>(mapping: &'a mut Mapping, key: &'a str) -> &'a mut Value {
@@ -239,6 +244,34 @@ a:
         .unwrap();
 
         assert_eq!(v, expected);
+    }
+
+    #[test]
+    fn overwrite_scalar_with_sequence() {
+        let v = yaml(&[r#"a.b = "scalar""#, r#"a.b[0] = "item""#]);
+
+        let expected = serde_yaml::from_str::<Value>(
+            r#"
+a:
+  b:
+    - item
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(v, expected);
+    }
+
+    #[test]
+    fn index_too_large_is_an_error() {
+        let result = build_traefik_file_yaml(vec![r#"a.items[99999999999] = "x""#]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn invalid_index_is_an_error() {
+        let result = build_traefik_file_yaml(vec![r#"a.items[x] = "x""#]);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -431,6 +464,23 @@ mod proptests {
 
     proptest! {
         #[test]
+        fn prop_mixed_scalar_and_index_on_same_key_never_panics(
+            assignments in prop::collection::vec(
+                (prop::option::of(0usize..5), yaml_value_strategy()),
+                1..6
+            )
+        ) {
+            let lines: Vec<String> = assignments
+                .iter()
+                .map(|(idx, value)| match idx {
+                    Some(idx) => format!("a.b[{idx}] = {value}"),
+                    None => format!("a.b = {value}"),
+                })
+                .collect();
+            prop_assert!(build_traefik_file_yaml(lines).is_ok());
+        }
+
+        #[test]
         fn prop_parse_path_never_panics(path in path_strategy()) {
             let _ = parse_path(&path);
         }
@@ -447,7 +497,7 @@ mod proptests {
 
         #[test]
         fn prop_parse_path_items_are_valid(path in path_strategy()) {
-            let items = parse_path(&path);
+            let items = parse_path(&path).unwrap();
             prop_assert!(!items.is_empty() || path.is_empty());
             for item in items {
                 match item {
@@ -479,7 +529,7 @@ mod proptests {
         #[test]
         fn prop_index_parsing_never_panics(idx_str in r"[0-9]{1,3}") {
             let path = format!("key[{}]", idx_str);
-            let items = parse_path(&path);
+            let items = parse_path(&path).unwrap();
             prop_assert!(items.len() == 1);
             if let PathItem::KeyIndex(_, idx) = &items[0] {
                 prop_assert!(idx >= &0);
@@ -508,7 +558,7 @@ mod proptests {
 
         #[test]
         fn prop_parse_path_with_empty_components(s in "a(\\.a){0,3}") {
-            let items = parse_path(&s);
+            let items = parse_path(&s).unwrap();
             for item in items {
                 match item {
                     PathItem::Key(k) => prop_assert!(!k.is_empty()),
